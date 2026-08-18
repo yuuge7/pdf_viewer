@@ -15,11 +15,13 @@ A robust, feature-rich Android application built with Flutter that allows users 
 If you'd like to contribute, run the app locally, or add new features, follow these steps:
 
 ### Prerequisites
+
 - [Flutter SDK](https://docs.flutter.dev/get-started/install) (Version 3.13.0 or higher)
 - Android Studio or any compatible IDE (VS Code, IntelliJ)
 - Java Development Kit (JDK 17 recommended)
 
 ### Installation
+
 1. Clone this repository:
    ```bash
    git clone https://github.com/yourusername/pdf_viewer.git
@@ -41,13 +43,8 @@ If you'd like to contribute, run the app locally, or add new features, follow th
 - `lib/screens/pdf_editor_screen.dart` - Core screen rendering the PDF and providing editing tools.
 - `lib/services/pdf_service.dart` - Utility methods for applying edits and saving new PDF copies.
 
-## Important Note on App Signing
-
-For convenience and automated releases, the release keystore (`upload-keystore.jks`) has been included directly in the root of the project. 
-
-> **Warning:** Keeping a keystore in a public repository is generally considered a security risk for production apps published to the Google Play Store. If you fork this project for production, **do not** commit your own keystore.
-
 ### Using the Keystore on Another Machine
+
 If you clone this repository on another machine, the keystore will automatically be available in the main folder. You can instantly build a signed release APK because the `android/app/build.gradle.kts` is already configured to point to it:
 
 ```bash
@@ -55,15 +52,17 @@ flutter build apk --release
 ```
 
 **Signature details:**
+
 - **Alias:** `upload`
 - **Store Password:** `pdfviewer123`
 - **Key Password:** `pdfviewer123`
 
 ## CI/CD Pipeline
 
-This project includes a `.github/workflows/release.yml` file. 
+This project includes a `.github/workflows/release.yml` file.
 
 Every time you **push to the `main` branch**:
+
 1. The GitHub Action automatically bumps the app version in `pubspec.yaml`.
 2. Commits the version bump back to the repository.
 3. Builds a signed Release APK using the included keystore.
