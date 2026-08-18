@@ -1,0 +1,95 @@
+name: Build and Release APK
+
+on:
+  push:
+    branches:
+      - main
+    # Prevent the action from running on its own version bump commit
+    paths-ignore:
+      - 'pubspec.yaml'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed for committing and creating releases
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Bump Version
+        id: bump_version
+        run: |
+          # Extract current version
+          CURRENT_VERSION=$(grep "^version: " pubspec.yaml | awk '{print $2}')
+          echo "Current version: $CURRENT_VERSION"
+          
+          # Split into name (1.0.0) and build number (1)
+          VERSION_NAME=$(echo $CURRENT_VERSION | cut -d'+' -f1)
+          BUILD_NUM=$(echo $CURRENT_VERSION | cut -d'+' -f2)
+          
+          # Split version name into major, minor, patch
+          MAJOR=$(echo $VERSION_NAME | cut -d'.' -f1)
+          MINOR=$(echo $VERSION_NAME | cut -d'.' -f2)
+          PATCH=$(echo $VERSION_NAME | cut -d'.' -f3)
+          
+          # Increment patch and build number
+          NEW_PATCH=$((PATCH + 1))
+          NEW_BUILD=$((BUILD_NUM + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}+${NEW_BUILD}"
+          
+          echo "New version: $NEW_VERSION"
+          
+          # Replace in pubspec.yaml
+          sed -i "s/^version: $CURRENT_VERSION/version: $NEW_VERSION/" pubspec.yaml
+          
+          # Set output for later steps
+          echo "VERSION_NAME=${MAJOR}.${MINOR}.${NEW_PATCH}" >> $GITHUB_ENV
+          echo "NEW_VERSION=${NEW_VERSION}" >> $GITHUB_ENV
+
+      - name: Commit and Push Version Bump
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add pubspec.yaml
+          git commit -m "chore: bump version to ${{ env.NEW_VERSION }} [skip ci]"
+          git push origin main
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Decode Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo $KEYSTORE_BASE64 | base64 --decode > upload-keystore.jks
+
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: flutter build apk --release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: PDF Viewer v${{ env.VERSION_NAME }}
+          files: build/app/outputs/flutter-apk/app-release.apk
+          generate_release_notes: true
