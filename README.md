@@ -51,12 +51,6 @@ If you clone this repository on another machine, the keystore will automatically
 flutter build apk --release
 ```
 
-**Signature details:**
-
-- **Alias:** `upload`
-- **Store Password:** `pdfviewer123`
-- **Key Password:** `pdfviewer123`
-
 ## CI/CD Pipeline
 
 This project includes a `.github/workflows/release.yml` file.
