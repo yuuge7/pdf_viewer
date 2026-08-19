@@ -36,6 +36,11 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   bool _isEnteringText = false;
   final TextEditingController _textOverlayController = TextEditingController();
 
+  Offset? _targetScrollOffset;
+  double? _targetZoom;
+  Size? _viewportSize;
+  Size? _pdfPageSize;
+
   @override
   void initState() {
     super.initState();
@@ -62,12 +67,36 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   Future<void> _commitHighlightAnnotation(Rect bounds) async {
     setState(() => _isLoading = true);
-    int pageIndex = (_pdfViewerController.pageNumber - 1).clamp(0, 9999);
     double zoom = _pdfViewerController.zoomLevel;
+    double scrollX = _pdfViewerController.scrollOffset.dx;
+    double scrollY = _pdfViewerController.scrollOffset.dy;
+    
+    // In continuous mode, scaling is based on fitting the width
+    double fitScale = _viewportSize!.width / _pdfPageSize!.width;
+    double actualScale = fitScale * zoom;
+
+    double renderedWidth = _pdfPageSize!.width * actualScale;
+    double offsetX = 0;
+    if (renderedWidth < _viewportSize!.width) {
+      offsetX = (_viewportSize!.width - renderedWidth) / 2;
+    }
+    
+    double pageHeightPixels = _pdfPageSize!.height * actualScale;
+    double pageSpacing = 4.0; 
+    double totalPageHeightPixels = pageHeightPixels + pageSpacing;
+
+    double globalTop = bounds.top + scrollY;
+    int pageIndex = (globalTop / totalPageHeightPixels).floor();
+    pageIndex = pageIndex.clamp(0, (_pdfViewerController.pageCount - 1).clamp(0, 9999));
+
+    double relativeTop = globalTop - (pageIndex * totalPageHeightPixels);
+    double relativeBottom = (bounds.bottom + scrollY) - (pageIndex * totalPageHeightPixels);
     
     Rect mappedBounds = Rect.fromLTRB(
-      bounds.left / zoom, bounds.top / zoom,
-      bounds.right / zoom, bounds.bottom / zoom
+      (bounds.left + scrollX - offsetX) / actualScale, 
+      relativeTop / actualScale,
+      (bounds.right + scrollX - offsetX) / actualScale, 
+      relativeBottom / actualScale
     );
 
     File? newFile = await PdfService.addHighlightAnnotation(_currentFile, pageIndex, mappedBounds);
@@ -77,10 +106,36 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   Future<void> _commitDrawAnnotation(List<Offset> points) async {
     setState(() => _isLoading = true);
-    int pageIndex = (_pdfViewerController.pageNumber - 1).clamp(0, 9999);
     double zoom = _pdfViewerController.zoomLevel;
+    double scrollX = _pdfViewerController.scrollOffset.dx;
+    double scrollY = _pdfViewerController.scrollOffset.dy;
     
-    List<Offset> mappedPoints = points.map((p) => Offset(p.dx / zoom, p.dy / zoom)).toList();
+    double fitScale = _viewportSize!.width / _pdfPageSize!.width;
+    double actualScale = fitScale * zoom;
+
+    double renderedWidth = _pdfPageSize!.width * actualScale;
+    double offsetX = 0;
+    if (renderedWidth < _viewportSize!.width) {
+      offsetX = (_viewportSize!.width - renderedWidth) / 2;
+    }
+    
+    double pageHeightPixels = _pdfPageSize!.height * actualScale;
+    double pageSpacing = 4.0; 
+    double totalPageHeightPixels = pageHeightPixels + pageSpacing;
+
+    // Use the first point to determine the page
+    double globalFirstY = points.first.dy + scrollY;
+    int pageIndex = (globalFirstY / totalPageHeightPixels).floor();
+    pageIndex = pageIndex.clamp(0, (_pdfViewerController.pageCount - 1).clamp(0, 9999));
+    
+    List<Offset> mappedPoints = points.map((p) {
+      double globalY = p.dy + scrollY;
+      double relativeY = globalY - (pageIndex * totalPageHeightPixels);
+      return Offset(
+        (p.dx + scrollX - offsetX) / actualScale, 
+        relativeY / actualScale
+      );
+    }).toList();
 
     File? newFile = await PdfService.addDrawAnnotation(_currentFile, pageIndex, mappedPoints);
     _handleNewFile(newFile, 'Drawing added successfully');
@@ -89,6 +144,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   void _handleNewFile(File? newFile, String successMessage) {
     if (newFile != null) {
+      _targetScrollOffset = _pdfViewerController.scrollOffset;
+      _targetZoom = _pdfViewerController.zoomLevel;
+      
       setState(() {
         if (_historyIndex < _history.length - 1) {
           _history.removeRange(_historyIndex + 1, _history.length);
@@ -113,6 +171,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   void _undo() {
     if (_historyIndex > 0) {
+      _targetScrollOffset = _pdfViewerController.scrollOffset;
+      _targetZoom = _pdfViewerController.zoomLevel;
       setState(() {
         _historyIndex--;
         _currentFile = _history[_historyIndex];
@@ -124,6 +184,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   void _redo() {
     if (_historyIndex < _history.length - 1) {
+      _targetScrollOffset = _pdfViewerController.scrollOffset;
+      _targetZoom = _pdfViewerController.zoomLevel;
       setState(() {
         _historyIndex++;
         _currentFile = _history[_historyIndex];
@@ -248,32 +310,38 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
           ),
         ],
       ),
-      body: Stack(
-        children: [
-          SfPdfViewer.file(
-            _currentFile,
-            key: _pdfViewerKey,
-            controller: _pdfViewerController,
-            canShowScrollHead: _activeTool == EditTool.none,
-            canShowScrollStatus: false, 
-            pageSpacing: 4,
-            onPageChanged: (PdfPageChangedDetails details) {
-              setState(() {}); 
-            },
-            onDocumentLoaded: (PdfDocumentLoadedDetails details) {
-              setState(() {});
-            },
-            onTap: (PdfGestureDetails details) {
-              if (_activeTool == EditTool.text && details.pageNumber != -1) {
-                setState(() {
-                  _textPosition = details.position;
-                  _pdfPagePosition = details.pagePosition;
-                  _textTargetPage = details.pageNumber - 1;
-                  _isEnteringText = true;
-                });
-              }
-            },
-          ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          _viewportSize = Size(constraints.maxWidth, constraints.maxHeight);
+          return Stack(
+            children: [
+              SfPdfViewer.file(
+                  _currentFile,
+                  key: _pdfViewerKey,
+                  controller: _pdfViewerController,
+                  initialScrollOffset: _targetScrollOffset ?? Offset.zero,
+                  initialZoomLevel: _targetZoom ?? 1.0,
+                  canShowScrollHead: _activeTool == EditTool.none,
+                  canShowScrollStatus: false, 
+                  pageSpacing: 4,
+                  onDocumentLoaded: (PdfDocumentLoadedDetails details) {
+                    if (details.document.pages.count > 0) {
+                      _pdfPageSize = details.document.pages[0].size;
+                    }
+                    setState(() {});
+                  },
+                  onTap: (PdfGestureDetails details) {
+                    if (_activeTool == EditTool.text) {
+                      setState(() {
+                        _pdfPagePosition = details.pagePosition;
+                        _textPosition = details.position;
+                        _textTargetPage = details.pageNumber;
+                        _isEnteringText = true;
+                        _textOverlayController.clear();
+                      });
+                    }
+                  },
+                ),
           
           if (_activeTool == EditTool.draw || _activeTool == EditTool.highlight)
             Positioned.fill(
@@ -371,7 +439,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
               ),
             ),
         ],
-      ),
+      );
+    }),
       bottomNavigationBar: BottomAppBar(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         height: 80,
