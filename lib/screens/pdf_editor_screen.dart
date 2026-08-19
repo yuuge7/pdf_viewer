@@ -280,10 +280,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onPanStart: (details) {
-                    setState(() {
-                      _currentDrawing = [details.localPosition];
-                    });
-                  }
+                  setState(() {
+                    _currentDrawing = [details.localPosition];
+                  });
                 },
                 onPanUpdate: (details) {
                   if (_activeTool == EditTool.draw || _activeTool == EditTool.highlight) {
