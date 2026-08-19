@@ -4,12 +4,29 @@ import 'package:flutter/material.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 import 'package:path_provider/path_provider.dart';
 
+class DrawStroke {
+  final List<Offset> points;
+  final Color color;
+  final double width;
+  DrawStroke({required this.points, required this.color, required this.width});
+}
+
+class HighlightRect {
+  final Rect bounds;
+  final Color color;
+  HighlightRect({required this.bounds, required this.color});
+}
+
 class PdfService {
   /// Adds a simple text annotation to a specific page of the PDF
-  static Future<File?> addTextAnnotation(File file, int pageIndex, String text, Offset position) async {
+  static Future<File?> addTextAnnotation(File file, int pageIndex, String text, Offset position, Color color, double fontSize) async {
     try {
       final List<int> bytes = await file.readAsBytes();
       
+      final int r = color.red;
+      final int g = color.green;
+      final int b = color.blue;
+
       final List<int>? savedBytes = await Isolate.run(() async {
         try {
           final PdfDocument document = PdfDocument(inputBytes: bytes);
@@ -17,9 +34,9 @@ class PdfService {
           final PdfPage page = document.pages[pageIndex];
           page.graphics.drawString(
             text,
-            PdfStandardFont(PdfFontFamily.helvetica, 24),
-            bounds: Rect.fromLTWH(position.dx, position.dy - 12, 500, 50),
-            brush: PdfBrushes.red,
+            PdfStandardFont(PdfFontFamily.helvetica, fontSize),
+            bounds: Rect.fromLTWH(position.dx, position.dy - (fontSize / 2), 500, fontSize * 2),
+            brush: PdfSolidBrush(PdfColor(r, g, b)),
           );
           final List<int> result = await document.save();
           document.dispose();
@@ -44,8 +61,8 @@ class PdfService {
     }
   }
 
-  /// Adds a highlight annotation to a specific bounds on a specific page
-  static Future<File?> addHighlightAnnotation(File file, int pageIndex, Rect bounds) async {
+  /// Adds multiple highlight annotations to a specific page
+  static Future<File?> addHighlightAnnotation(File file, int pageIndex, List<HighlightRect> highlights) async {
     try {
       final List<int> bytes = await file.readAsBytes();
       
@@ -55,13 +72,15 @@ class PdfService {
           if (document.pages.count <= pageIndex) return null;
           final PdfPage page = document.pages[pageIndex];
           
-          final PdfTextMarkupAnnotation highlightAnnotation = PdfTextMarkupAnnotation(
-            bounds,
-            'Highlight',
-            PdfColor(255, 255, 0),
-          );
-          highlightAnnotation.textMarkupAnnotationType = PdfTextMarkupAnnotationType.highlight;
-          page.annotations.add(highlightAnnotation);
+          for (final h in highlights) {
+            final PdfTextMarkupAnnotation highlightAnnotation = PdfTextMarkupAnnotation(
+              h.bounds,
+              'Highlight',
+              PdfColor(h.color.red, h.color.green, h.color.blue),
+            );
+            highlightAnnotation.textMarkupAnnotationType = PdfTextMarkupAnnotationType.highlight;
+            page.annotations.add(highlightAnnotation);
+          }
 
           final List<int> result = await document.save();
           document.dispose();
@@ -85,8 +104,8 @@ class PdfService {
     }
   }
 
-  /// Adds a draw annotation (path/lines) to a specific page
-  static Future<File?> addDrawAnnotation(File file, int pageIndex, List<Offset> points) async {
+  /// Adds multiple draw annotations (paths/lines) to a specific page
+  static Future<File?> addDrawAnnotation(File file, int pageIndex, List<DrawStroke> strokes) async {
     try {
       final List<int> bytes = await file.readAsBytes();
       
@@ -96,13 +115,15 @@ class PdfService {
           if (document.pages.count <= pageIndex) return null;
           final PdfPage page = document.pages[pageIndex];
           
-          if (points.length > 1) {
-            final PdfPen pen = PdfPen(PdfColor(0, 0, 255), width: 3);
-            final PdfPath path = PdfPath();
-            for (int i = 0; i < points.length - 1; i++) {
-              path.addLine(points[i], points[i + 1]);
+          for (final stroke in strokes) {
+            if (stroke.points.length > 1) {
+              final PdfPen pen = PdfPen(PdfColor(stroke.color.red, stroke.color.green, stroke.color.blue), width: stroke.width);
+              final PdfPath path = PdfPath();
+              for (int i = 0; i < stroke.points.length - 1; i++) {
+                path.addLine(stroke.points[i], stroke.points[i + 1]);
+              }
+              page.graphics.drawPath(path, pen: pen);
             }
-            page.graphics.drawPath(path, pen: pen);
           }
 
           final List<int> result = await document.save();

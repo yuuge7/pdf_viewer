@@ -30,6 +30,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   EditTool _activeTool = EditTool.none;
   List<Offset> _currentDrawing = [];
+  List<DrawStroke> _pendingDrawStrokes = [];
+  List<HighlightRect> _pendingHighlights = [];
   Offset? _textPosition;
   Offset? _pdfPagePosition;
   int? _textTargetPage;
@@ -40,6 +42,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   double? _targetZoom;
   Size? _viewportSize;
   Size? _pdfPageSize;
+
+  Color _selectedTextColor = Colors.red;
+  double _selectedTextSize = 24.0;
+  Color _selectedDrawColor = Colors.blue;
+  double _selectedDrawWidth = 3.0;
+  Color _selectedHighlightColor = Colors.yellow;
 
   @override
   void initState() {
@@ -52,7 +60,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     if (_pdfPagePosition == null || _textTargetPage == null || text.isEmpty) return;
     setState(() => _isLoading = true);
     
-    File? newFile = await PdfService.addTextAnnotation(_currentFile, _textTargetPage!, text, _pdfPagePosition!);
+    File? newFile = await PdfService.addTextAnnotation(_currentFile, _textTargetPage!, text, _pdfPagePosition!, _selectedTextColor, _selectedTextSize);
     _handleNewFile(newFile, 'Text added successfully');
     
     setState(() {
@@ -65,7 +73,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     });
   }
 
-  Future<void> _commitHighlightAnnotation(Rect bounds) async {
+  Future<void> _commitPendingHighlight() async {
+    if (_pendingHighlights.isEmpty) return;
     setState(() => _isLoading = true);
     double zoom = _pdfViewerController.zoomLevel;
     double scrollX = _pdfViewerController.scrollOffset.dx;
@@ -85,26 +94,31 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     double pageSpacing = 4.0; 
     double totalPageHeightPixels = pageHeightPixels + pageSpacing;
 
-    double globalTop = bounds.top + scrollY;
+    double globalTop = _pendingHighlights.first.bounds.top + scrollY;
     int pageIndex = (globalTop / totalPageHeightPixels).floor();
     pageIndex = pageIndex.clamp(0, (_pdfViewerController.pageCount - 1).clamp(0, 9999));
 
-    double relativeTop = globalTop - (pageIndex * totalPageHeightPixels);
-    double relativeBottom = (bounds.bottom + scrollY) - (pageIndex * totalPageHeightPixels);
-    
-    Rect mappedBounds = Rect.fromLTRB(
-      (bounds.left + scrollX - offsetX) / actualScale, 
-      relativeTop / actualScale,
-      (bounds.right + scrollX - offsetX) / actualScale, 
-      relativeBottom / actualScale
-    );
+    List<HighlightRect> mappedHighlights = _pendingHighlights.map((h) {
+      double relativeTop = (h.bounds.top + scrollY) - (pageIndex * totalPageHeightPixels);
+      double relativeBottom = (h.bounds.bottom + scrollY) - (pageIndex * totalPageHeightPixels);
+      
+      Rect mappedBounds = Rect.fromLTRB(
+        (h.bounds.left + scrollX - offsetX) / actualScale, 
+        relativeTop / actualScale,
+        (h.bounds.right + scrollX - offsetX) / actualScale, 
+        relativeBottom / actualScale
+      );
+      return HighlightRect(bounds: mappedBounds, color: h.color);
+    }).toList();
 
-    File? newFile = await PdfService.addHighlightAnnotation(_currentFile, pageIndex, mappedBounds);
+    File? newFile = await PdfService.addHighlightAnnotation(_currentFile, pageIndex, mappedHighlights);
+    _pendingHighlights.clear();
     _handleNewFile(newFile, 'Highlight added successfully');
-    setState(() => _activeTool = EditTool.none);
+    setState(() {});
   }
 
-  Future<void> _commitDrawAnnotation(List<Offset> points) async {
+  Future<void> _commitPendingDrawStrokes() async {
+    if (_pendingDrawStrokes.isEmpty) return;
     setState(() => _isLoading = true);
     double zoom = _pdfViewerController.zoomLevel;
     double scrollX = _pdfViewerController.scrollOffset.dx;
@@ -124,22 +138,26 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     double totalPageHeightPixels = pageHeightPixels + pageSpacing;
 
     // Use the first point to determine the page
-    double globalFirstY = points.first.dy + scrollY;
+    double globalFirstY = _pendingDrawStrokes.first.points.first.dy + scrollY;
     int pageIndex = (globalFirstY / totalPageHeightPixels).floor();
     pageIndex = pageIndex.clamp(0, (_pdfViewerController.pageCount - 1).clamp(0, 9999));
     
-    List<Offset> mappedPoints = points.map((p) {
-      double globalY = p.dy + scrollY;
-      double relativeY = globalY - (pageIndex * totalPageHeightPixels);
-      return Offset(
-        (p.dx + scrollX - offsetX) / actualScale, 
-        relativeY / actualScale
-      );
+    List<DrawStroke> mappedStrokes = _pendingDrawStrokes.map((stroke) {
+      List<Offset> mappedPoints = stroke.points.map((p) {
+        double globalY = p.dy + scrollY;
+        double relativeY = globalY - (pageIndex * totalPageHeightPixels);
+        return Offset(
+          (p.dx + scrollX - offsetX) / actualScale, 
+          relativeY / actualScale
+        );
+      }).toList();
+      return DrawStroke(points: mappedPoints, color: stroke.color, width: stroke.width);
     }).toList();
 
-    File? newFile = await PdfService.addDrawAnnotation(_currentFile, pageIndex, mappedPoints);
+    File? newFile = await PdfService.addDrawAnnotation(_currentFile, pageIndex, mappedStrokes);
+    _pendingDrawStrokes.clear();
     _handleNewFile(newFile, 'Drawing added successfully');
-    setState(() => _activeTool = EditTool.none);
+    setState(() {});
   }
 
   void _handleNewFile(File? newFile, String successMessage) {
@@ -220,6 +238,18 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
       files: [XFile(_currentFile.path)],
       text: 'Here is my document from ProPDF Studio',
     ));
+  }
+
+  Future<void> _changeTool(EditTool newTool) async {
+    if (_activeTool == EditTool.draw && _pendingDrawStrokes.isNotEmpty) {
+      await _commitPendingDrawStrokes();
+    }
+    if (_activeTool == EditTool.highlight && _pendingHighlights.isNotEmpty) {
+      await _commitPendingHighlight();
+    }
+    setState(() {
+      _activeTool = newTool;
+    });
   }
 
   @override
@@ -310,9 +340,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
           ),
         ],
       ),
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          _viewportSize = Size(constraints.maxWidth, constraints.maxHeight);
+      body: Builder(
+        builder: (context) {
+          _viewportSize = MediaQuery.of(context).size;
           return Stack(
             children: [
               SfPdfViewer.file(
@@ -321,7 +351,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
                   controller: _pdfViewerController,
                   initialScrollOffset: _targetScrollOffset ?? Offset.zero,
                   initialZoomLevel: _targetZoom ?? 1.0,
-                  canShowScrollHead: _activeTool == EditTool.none,
+                  canShowScrollHead: false,
                   canShowScrollStatus: false, 
                   pageSpacing: 4,
                   onDocumentLoaded: (PdfDocumentLoadedDetails details) {
@@ -362,14 +392,21 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
                 onPanEnd: (details) {
                   if (_currentDrawing.length > 1) {
                     if (_activeTool == EditTool.draw) {
-                      _commitDrawAnnotation(List.from(_currentDrawing));
+                      _pendingDrawStrokes.add(DrawStroke(
+                        points: List.from(_currentDrawing),
+                        color: _selectedDrawColor,
+                        width: _selectedDrawWidth,
+                      ));
                     } else if (_activeTool == EditTool.highlight) {
                       // Bounding box of drawing
                       double minX = _currentDrawing.map((e) => e.dx).reduce((a, b) => a < b ? a : b);
                       double maxX = _currentDrawing.map((e) => e.dx).reduce((a, b) => a > b ? a : b);
                       double minY = _currentDrawing.map((e) => e.dy).reduce((a, b) => a < b ? a : b);
                       double maxY = _currentDrawing.map((e) => e.dy).reduce((a, b) => a > b ? a : b);
-                      _commitHighlightAnnotation(Rect.fromLTRB(minX, minY, maxX, maxY));
+                      _pendingHighlights.add(HighlightRect(
+                        bounds: Rect.fromLTRB(minX, minY, maxX, maxY),
+                        color: _selectedHighlightColor,
+                      ));
                     }
                   }
                   setState(() {
@@ -379,7 +416,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
                 child: CustomPaint(
                   painter: _DrawingPainter(
                     points: _currentDrawing, 
-                    tool: _activeTool
+                    tool: _activeTool,
+                    drawColor: _selectedDrawColor,
+                    drawWidth: _selectedDrawWidth,
+                    highlightColor: _selectedHighlightColor,
+                    pendingDrawStrokes: _pendingDrawStrokes,
+                    pendingHighlights: _pendingHighlights,
                   ),
                 ),
               ),
@@ -438,6 +480,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
                 child: CircularProgressIndicator(),
               ),
             ),
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: _buildToolSettingsBar(theme),
+          ),
         ],
       );
     }),
@@ -450,13 +498,13 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
             _buildToolBtn(Icons.text_fields_rounded, 'Text', () {
-              setState(() => _activeTool = _activeTool == EditTool.text ? EditTool.none : EditTool.text);
+              _changeTool(_activeTool == EditTool.text ? EditTool.none : EditTool.text);
             }, theme, isActive: _activeTool == EditTool.text),
             _buildToolBtn(Icons.highlight_rounded, 'Highlight', () {
-              setState(() => _activeTool = _activeTool == EditTool.highlight ? EditTool.none : EditTool.highlight);
+              _changeTool(_activeTool == EditTool.highlight ? EditTool.none : EditTool.highlight);
             }, theme, isActive: _activeTool == EditTool.highlight),
             _buildToolBtn(Icons.draw_rounded, 'Draw', () {
-              setState(() => _activeTool = _activeTool == EditTool.draw ? EditTool.none : EditTool.draw);
+              _changeTool(_activeTool == EditTool.draw ? EditTool.none : EditTool.draw);
             }, theme, isActive: _activeTool == EditTool.draw),
             _buildToolBtn(Icons.search_rounded, 'Search', () {
                setState(() {
@@ -493,16 +541,173 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
       ),
     );
   }
+
+  Widget _buildToolSettingsBar(ThemeData theme) {
+    if (_activeTool == EditTool.none) return const SizedBox.shrink();
+
+    Widget content = const SizedBox.shrink();
+
+    if (_activeTool == EditTool.text) {
+      content = Row(
+        children: [
+          const Text('Size:'),
+          Expanded(
+            child: Slider(
+              value: _selectedTextSize,
+              min: 12.0,
+              max: 72.0,
+              divisions: 30,
+              label: _selectedTextSize.round().toString(),
+              onChanged: (val) => setState(() => _selectedTextSize = val),
+            ),
+          ),
+          _buildColorPicker(Colors.black, (c) => setState(() => _selectedTextColor = c), _selectedTextColor),
+          _buildColorPicker(Colors.red, (c) => setState(() => _selectedTextColor = c), _selectedTextColor),
+          _buildColorPicker(Colors.blue, (c) => setState(() => _selectedTextColor = c), _selectedTextColor),
+        ],
+      );
+    } else if (_activeTool == EditTool.draw) {
+      content = Row(
+        children: [
+          const Text('Width:'),
+          Expanded(
+            child: Slider(
+              value: _selectedDrawWidth,
+              min: 1.0,
+              max: 20.0,
+              divisions: 19,
+              label: _selectedDrawWidth.round().toString(),
+              onChanged: (val) => setState(() => _selectedDrawWidth = val),
+            ),
+          ),
+          _buildColorPicker(Colors.black, (c) => setState(() => _selectedDrawColor = c), _selectedDrawColor),
+          _buildColorPicker(Colors.blue, (c) => setState(() => _selectedDrawColor = c), _selectedDrawColor),
+          _buildColorPicker(Colors.red, (c) => setState(() => _selectedDrawColor = c), _selectedDrawColor),
+          if (_pendingDrawStrokes.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 8.0),
+              child: FilledButton(
+                onPressed: _commitPendingDrawStrokes,
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  minimumSize: const Size(0, 36),
+                ),
+                child: const Text('Apply'),
+              ),
+            ),
+        ],
+      );
+    } else if (_activeTool == EditTool.highlight) {
+      content = Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _buildColorPicker(Colors.yellow, (c) => setState(() => _selectedHighlightColor = c), _selectedHighlightColor),
+          _buildColorPicker(Colors.greenAccent, (c) => setState(() => _selectedHighlightColor = c), _selectedHighlightColor),
+          _buildColorPicker(Colors.lightBlueAccent, (c) => setState(() => _selectedHighlightColor = c), _selectedHighlightColor),
+          _buildColorPicker(Colors.pinkAccent, (c) => setState(() => _selectedHighlightColor = c), _selectedHighlightColor),
+          if (_pendingHighlights.isNotEmpty)
+            FilledButton(
+              onPressed: _commitPendingHighlight,
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                minimumSize: const Size(0, 36),
+              ),
+              child: const Text('Apply'),
+            ),
+        ],
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHigh,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withAlpha(20),
+            blurRadius: 4,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: content,
+    );
+  }
+
+  Widget _buildColorPicker(Color color, Function(Color) onSelect, Color selectedColor) {
+    bool isSelected = color.value == selectedColor.value;
+    return GestureDetector(
+      onTap: () => onSelect(color),
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 4),
+        width: 32,
+        height: 32,
+        decoration: BoxDecoration(
+          color: color,
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: isSelected ? Colors.white : Colors.transparent,
+            width: 3,
+          ),
+          boxShadow: [
+            if (isSelected)
+              BoxShadow(
+                color: Colors.black.withAlpha(80),
+                blurRadius: 4,
+                spreadRadius: 1,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _DrawingPainter extends CustomPainter {
   final List<Offset> points;
   final EditTool tool;
+  final Color drawColor;
+  final double drawWidth;
+  final Color highlightColor;
+  final List<DrawStroke> pendingDrawStrokes;
+  final List<HighlightRect> pendingHighlights;
 
-  _DrawingPainter({required this.points, required this.tool});
+  _DrawingPainter({
+    required this.points, 
+    required this.tool,
+    required this.drawColor,
+    required this.drawWidth,
+    required this.highlightColor,
+    required this.pendingDrawStrokes,
+    required this.pendingHighlights,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Draw all pending highlights
+    for (final h in pendingHighlights) {
+      final hPaint = Paint()
+        ..color = h.color.withAlpha(128)
+        ..style = PaintingStyle.fill;
+      canvas.drawRect(h.bounds, hPaint);
+    }
+
+    // Draw all pending strokes
+    for (final stroke in pendingDrawStrokes) {
+      if (stroke.points.isEmpty) continue;
+      final strokePaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..color = stroke.color
+        ..strokeWidth = stroke.width;
+      
+      final path = Path()..moveTo(stroke.points.first.dx, stroke.points.first.dy);
+      for (int i = 1; i < stroke.points.length; i++) {
+        path.lineTo(stroke.points[i].dx, stroke.points[i].dy);
+      }
+      canvas.drawPath(path, strokePaint);
+    }
+
     if (points.isEmpty) return;
 
     final paint = Paint()
@@ -510,8 +715,8 @@ class _DrawingPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
 
     if (tool == EditTool.draw) {
-      paint.color = Colors.blue;
-      paint.strokeWidth = 3;
+      paint.color = drawColor;
+      paint.strokeWidth = drawWidth;
       
       final path = Path()..moveTo(points.first.dx, points.first.dy);
       for (int i = 1; i < points.length; i++) {
@@ -519,7 +724,7 @@ class _DrawingPainter extends CustomPainter {
       }
       canvas.drawPath(path, paint);
     } else if (tool == EditTool.highlight) {
-      paint.color = Colors.yellow.withAlpha(128);
+      paint.color = highlightColor.withAlpha(128);
       paint.style = PaintingStyle.fill;
 
       double minX = points.map((e) => e.dx).reduce((a, b) => a < b ? a : b);
