@@ -24,7 +24,7 @@ class _HomeScreenState extends State<HomeScreen> {
         allowedExtensions: ['pdf'],
       );
 
-      if (result != null && result.isNotEmpty) {
+      if (result.isNotEmpty) {
         File file = File(result.first.path!);
         
         if (mounted) {

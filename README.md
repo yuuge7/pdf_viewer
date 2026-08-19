@@ -6,7 +6,11 @@ A robust, feature-rich Android application built with Flutter that allows users 
 
 - **File Picker Integration:** Easily browse and select PDF files from the device.
 - **Fast PDF Rendering:** Smooth viewing experience using Syncfusion PDF Viewer.
-- **Editing Capabilities:** Modify PDFs by adding text annotations and highlights dynamically.
+- **Editing Capabilities:** Modify PDFs by adding text annotations, highlights, and freehand drawing dynamically.
+- **Undo/Redo History:** Easily revert or re-apply your changes with full history tracking.
+- **Save & Overwrite:** Save your edits directly over the original file seamlessly.
+- **Search:** Search text within the PDF document with navigation controls.
+- **Navigation:** Custom page indicator that displays the current and total page numbers alongside the native scroll head.
 - **Export & Share:** Instantly share the edited document via native sharing options.
 - **Automated CI/CD:** Fully integrated GitHub Actions workflow for automatic version bumping and APK releases.
 
