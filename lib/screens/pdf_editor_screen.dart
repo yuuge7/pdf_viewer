@@ -31,6 +31,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   EditTool _activeTool = EditTool.none;
   List<Offset> _currentDrawing = [];
   Offset? _textPosition;
+  Offset? _pdfPagePosition;
+  int? _textTargetPage;
   bool _isEnteringText = false;
   final TextEditingController _textOverlayController = TextEditingController();
 
@@ -42,23 +44,16 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Future<void> _commitTextAnnotation(String text) async {
-    if (_textPosition == null || text.isEmpty) return;
+    if (_pdfPagePosition == null || _textTargetPage == null || text.isEmpty) return;
     setState(() => _isLoading = true);
     
-    int pageIndex = (_pdfViewerController.pageNumber - 1).clamp(0, 9999);
-    double zoom = _pdfViewerController.zoomLevel;
-    
-    // Naive coordinate mapping relative to screen tap
-    Offset mappedPosition = Offset(
-      _textPosition!.dx / zoom,
-      _textPosition!.dy / zoom, 
-    );
-
-    File? newFile = await PdfService.addTextAnnotation(_currentFile, pageIndex, text, mappedPosition);
+    File? newFile = await PdfService.addTextAnnotation(_currentFile, _textTargetPage!, text, _pdfPagePosition!);
     _handleNewFile(newFile, 'Text added successfully');
     
     setState(() {
       _textPosition = null;
+      _pdfPagePosition = null;
+      _textTargetPage = null;
       _isEnteringText = false;
       _textOverlayController.clear();
       _activeTool = EditTool.none;
@@ -268,22 +263,23 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
             onDocumentLoaded: (PdfDocumentLoadedDetails details) {
               setState(() {});
             },
+            onTap: (PdfGestureDetails details) {
+              if (_activeTool == EditTool.text && details.pageNumber != -1) {
+                setState(() {
+                  _textPosition = details.position;
+                  _pdfPagePosition = details.pagePosition;
+                  _textTargetPage = details.pageNumber - 1;
+                  _isEnteringText = true;
+                });
+              }
+            },
           ),
           
-          if (_activeTool != EditTool.none)
+          if (_activeTool == EditTool.draw || _activeTool == EditTool.highlight)
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onTapUp: (details) {
-                  if (_activeTool == EditTool.text) {
-                    setState(() {
-                      _textPosition = details.localPosition;
-                      _isEnteringText = true;
-                    });
-                  }
-                },
                 onPanStart: (details) {
-                  if (_activeTool == EditTool.draw || _activeTool == EditTool.highlight) {
                     setState(() {
                       _currentDrawing = [details.localPosition];
                     });
