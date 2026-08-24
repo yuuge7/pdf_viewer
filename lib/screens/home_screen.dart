@@ -74,15 +74,25 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      List<PlatformFile>? result = await FilePicker.pickFiles(
+      List<PlatformFile> result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['pdf'],
       );
 
       if (result.isNotEmpty) {
-        File file = File(result.first.path!);
+        // path is null on platforms that hand back bytes instead of a file.
+        final String? path = result.first.path;
+        if (path == null) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('That file cannot be opened.')),
+            );
+          }
+          return;
+        }
+        File file = File(path);
         await _addRecentFile(file.path);
-        
+
         if (mounted) {
           Navigator.push(
             context,
@@ -116,13 +126,6 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('ProPDF Studio', style: TextStyle(fontWeight: FontWeight.w600)),
         centerTitle: false,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings_outlined),
-            onPressed: () {},
-          ),
-          const SizedBox(width: 8),
-        ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -203,21 +206,11 @@ class _HomeScreenState extends State<HomeScreen> {
               
               const SizedBox(height: 40),
               
-              // Recent Files Placeholder Section
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    'Recent Files',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: () {},
-                    child: const Text('View All'),
-                  ),
-                ],
+              Text(
+                'Recent Files',
+                style: theme.textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               const SizedBox(height: 16),
               

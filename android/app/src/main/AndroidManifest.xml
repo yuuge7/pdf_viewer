@@ -1,8 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+    <!-- Scoped storage replaced these on API 29+. The file picker hands back a
+         content URI there, so the legacy permissions are only needed on older
+         devices; requesting them unbounded gets flagged during store review. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
     <application
-        android:label="pdf_viewer"
+        android:label="ProPDF Studio"
         android:name="${applicationName}"
         android:icon="@mipmap/launcher_icon">
         <activity

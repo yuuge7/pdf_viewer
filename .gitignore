@@ -11,6 +11,8 @@
 .svn/
 .swiftpm/
 migrate_working_dir/
+*.md
+!README.md
 
 # IntelliJ related
 *.iml
@@ -51,3 +53,7 @@ app.*.map.json
 upload-keystore.jks
 *.jks
 *.keystore
+
+# Local signing credentials (never commit)
+android/key.properties
+key.properties

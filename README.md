@@ -47,13 +47,36 @@ If you'd like to contribute, run the app locally, or add new features, follow th
 - `lib/screens/pdf_editor_screen.dart` - Core screen rendering the PDF and providing editing tools.
 - `lib/services/pdf_service.dart` - Utility methods for applying edits and saving new PDF copies.
 
-### Using the Keystore on Another Machine
+### Release Signing
 
-If you clone this repository on another machine, the keystore will automatically be available in the main folder. You can instantly build a signed release APK because the `android/app/build.gradle.kts` is already configured to point to it:
+The keystore is **not** in the repository — `.gitignore` excludes `*.jks`, and it never has been committed. A fresh clone therefore cannot produce a distributable APK until you supply the signing material yourself.
 
-```bash
-flutter build apk --release
-```
+To build a signed release locally:
+
+1. Put `upload-keystore.jks` in the repository root (copy it from a machine that already has it, or from your password manager).
+2. Create `android/key.properties` (git-ignored):
+
+   ```properties
+   storePassword=<your store password>
+   keyAlias=upload
+   keyPassword=<your key password>
+   ```
+
+3. Build:
+
+   ```bash
+   flutter build apk --release
+   ```
+
+If either the keystore or the credentials are missing, the release build still succeeds but is signed with the **debug** key and Gradle prints a warning. Such an APK cannot be installed as an update over a properly signed one, and cannot be distributed. Check the build log if a release APK behaves unexpectedly.
+
+CI does not use `key.properties`; it decodes the keystore from the `KEYSTORE_BASE64` secret and passes `KEYSTORE_PASSWORD`, `KEY_ALIAS`, and `KEY_PASSWORD` as environment variables, which take precedence.
+
+### Known Limitation: Saving on Android
+
+On Android the file picker returns a **copy** of the chosen document in the app's cache directory, not the original file the user sees in their file manager. "Save" therefore overwrites that copy, and the user's original document on shared storage is left unchanged. It also means a cached path stored in Recent Files can be cleared by the system, which is why opening a recent entry sometimes reports "File no longer exists".
+
+Use **Share** to get an edited document back out of the app. Writing back to the original location needs a Storage Access Framework round trip, which this app does not implement yet.
 
 ## CI/CD Pipeline
 
