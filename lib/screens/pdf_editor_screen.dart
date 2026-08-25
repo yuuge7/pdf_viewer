@@ -7,8 +7,11 @@ import 'package:share_plus/share_plus.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart' show PdfPage, PdfPageRotateAngle;
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
+import '../services/document_service.dart';
 import '../services/pdf_page_geometry.dart';
 import '../services/pdf_service.dart';
+import '../services/recent_documents.dart';
+import '../widgets/page_thumbnails.dart';
 
 enum EditTool { none, text, highlight, draw }
 
@@ -56,9 +59,9 @@ class _PendingHighlight {
 }
 
 class PdfEditorScreen extends StatefulWidget {
-  final File file;
+  final DocumentRef document;
 
-  const PdfEditorScreen({super.key, required this.file});
+  const PdfEditorScreen({super.key, required this.document});
 
   @override
   State<PdfEditorScreen> createState() => _PdfEditorScreenState();
@@ -116,7 +119,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   @override
   void initState() {
     super.initState();
-    _currentFile = widget.file;
+    _currentFile = widget.document.file;
+    _savedPath = _currentFile.path;
     _history.add(_currentFile);
     _sweepStaleTempFiles();
   }
@@ -360,7 +364,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     WidgetsBinding.instance
         .addPostFrameCallback((_) => oldController.dispose());
     // Never delete the file the user opened.
-    _deleteAll(orphaned.where((f) => f.path != widget.file.path));
+    _deleteAll(orphaned.where((f) => f.path != widget.document.path));
   }
 
   void _undo() {
@@ -377,22 +381,94 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   // --- Save / share ----------------------------------------------------------
 
+  /// Path the document on disk currently matches. Starts as the file that was
+  /// opened and moves forward on each successful save.
+  late String _savedPath;
+
+  bool get _hasUnsavedChanges => _currentFile.path != _savedPath;
+
   Future<void> _savePdf() async {
-    if (_currentFile.path == widget.file.path) {
+    if (!_hasUnsavedChanges) {
       _showMessage('No changes to save.');
       return;
     }
+    // Without a write grant the only honest option is Save a copy: writing to
+    // the cache path would report success and change nothing the user can see.
+    if (!widget.document.savesInPlace) {
+      _showMessage('This document is read-only. Use Save a copy.');
+      await _saveCopy();
+      return;
+    }
+
     setState(() => _isLoading = true);
     try {
-      await _currentFile.copy(widget.file.path);
+      await DocumentService.write(widget.document, _currentFile);
       if (!mounted) return;
-      _showMessage('Saved successfully!');
+      // The document on disk now matches this file, so Save reports "no
+      // changes" until the next edit. History is deliberately left alone --
+      // rewriting _history[0] would make Undo jump to a file the user never
+      // navigated to.
+      setState(() => _savedPath = _currentFile.path);
+      _showMessage('Saved to ${widget.document.name}');
     } catch (e) {
       if (!mounted) return;
       _showMessage('Failed to save: $e');
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  Future<void> _saveCopy() async {
+    if (!DocumentService.supportsSaf) {
+      _showMessage('Saving a copy is not supported on this platform.');
+      return;
+    }
+    setState(() => _isLoading = true);
+    try {
+      final DocumentRef? saved = await DocumentService.saveCopy(
+        _suggestedCopyName(),
+        _currentFile,
+      );
+      if (!mounted) return;
+      if (saved == null) return; // Cancelled.
+      // The native side took a persistable grant on the new document. Record
+      // it, or that grant leaks and the copy never appears in Recent Files.
+      await RecentDocuments.add(saved);
+      _showMessage('Saved a copy as ${saved.name}');
+    } catch (e) {
+      if (!mounted) return;
+      _showMessage('Failed to save a copy: $e');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // --- Navigation ------------------------------------------------------------
+
+  Future<void> _showThumbnails() async {
+    // Captured up front: flushing swaps the document, which clears _pageSizes
+    // until the replacement finishes loading. Annotations never change the page
+    // count, so the pre-flush value stays correct for the new file.
+    final int pageCount = _pageSizes.length;
+    if (pageCount == 0) return;
+    // Any tool holding unmapped work must be flushed first: jumping pages
+    // moves the viewer transform the pending strokes were captured against.
+    await _changeTool(EditTool.none);
+    if (!mounted) return;
+    await PageThumbnails.show(
+      context,
+      path: _currentFile.path,
+      pageCount: pageCount,
+      currentPage: _currentPage,
+      onSelect: (page) => _pdfViewerController.jumpToPage(page),
+    );
+  }
+
+  String _suggestedCopyName() {
+    final String name = widget.document.name;
+    final int dot = name.lastIndexOf('.');
+    if (dot <= 0) return '$name (edited).pdf';
+    return '${name.substring(0, dot)} (edited)${name.substring(dot)}';
   }
 
   Future<void> _sharePdf() async {
@@ -679,7 +755,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Widget _buildTitle() => Text(
-        widget.file.path.split(Platform.pathSeparator).last,
+        widget.document.name,
         style: const TextStyle(fontSize: 16),
         overflow: TextOverflow.ellipsis,
       );
@@ -749,14 +825,52 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
         tooltip: 'Save',
       ),
       IconButton(
-        icon: const Icon(Icons.share_rounded),
-        onPressed: _isLoading ? null : _sharePdf,
-        tooltip: 'Share',
+        icon: const Icon(Icons.grid_view_rounded),
+        onPressed: _pageSizes.isEmpty ? null : _showThumbnails,
+        tooltip: 'Pages',
       ),
-      IconButton(
-        icon: const Icon(Icons.bookmark_border_rounded),
-        onPressed: () => _pdfViewerKey.currentState?.openBookmarkView(),
-        tooltip: 'Bookmarks',
+      PopupMenuButton<String>(
+        tooltip: 'More',
+        onSelected: (value) {
+          switch (value) {
+            case 'copy':
+              _saveCopy();
+            case 'share':
+              _sharePdf();
+            case 'bookmarks':
+              _pdfViewerKey.currentState?.openBookmarkView();
+          }
+        },
+        itemBuilder: (context) => [
+          if (DocumentService.supportsSaf)
+            const PopupMenuItem(
+              value: 'copy',
+              child: ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(Icons.save_as_rounded),
+                title: Text('Save a copy'),
+              ),
+            ),
+          const PopupMenuItem(
+            value: 'share',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.share_rounded),
+              title: Text('Share'),
+            ),
+          ),
+          const PopupMenuItem(
+            value: 'bookmarks',
+            child: ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.bookmark_border_rounded),
+              title: Text('Bookmarks'),
+            ),
+          ),
+        ],
       ),
     ];
   }
@@ -821,17 +935,32 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     return Positioned(
       bottom: 16,
       right: 16,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(
-          color: Colors.black.withAlpha(178),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: _isLoading ? null : _showThumbnails,
           borderRadius: BorderRadius.circular(16),
-        ),
-        child: Text(
-          '$_currentPage/${_pageSizes.length}',
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black.withAlpha(178),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.grid_view_rounded,
+                    color: Colors.white, size: 14),
+                const SizedBox(width: 6),
+                Text(
+                  '$_currentPage/${_pageSizes.length}',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

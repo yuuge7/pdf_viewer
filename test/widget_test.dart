@@ -4,9 +4,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdf_viewer/main.dart';
 import 'package:pdf_viewer/screens/home_screen.dart';
+import 'package:pdf_viewer/services/document_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 String p(List<String> parts) => parts.join(Platform.pathSeparator);
+
+DocumentRef refFor(String name, {String? uri, bool canWrite = true}) =>
+    DocumentRef(
+      path: p(['docs', name]),
+      name: name,
+      uri: uri,
+      canWrite: canWrite,
+    );
 
 Future<void> pumpHome(WidgetTester tester) async {
   await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
@@ -31,7 +40,6 @@ void main() {
     testWidgets('has no dead placeholder actions', (tester) async {
       await pumpHome(tester);
 
-      // These used to render but do nothing when tapped.
       expect(find.text('View All'), findsNothing);
       expect(find.byIcon(Icons.settings_outlined), findsNothing);
     });
@@ -45,11 +53,11 @@ void main() {
       expect(find.byType(ListTile), findsNothing);
     });
 
-    testWidgets('lists stored files newest first', (tester) async {
+    testWidgets('lists stored documents newest first', (tester) async {
       SharedPreferences.setMockInitialValues({
         'recent_files': [
-          p(['docs', 'newest.pdf']),
-          p(['docs', 'older.pdf']),
+          refFor('newest.pdf').encode(),
+          refFor('older.pdf').encode(),
         ],
       });
       await pumpHome(tester);
@@ -63,11 +71,23 @@ void main() {
       expect(((tiles.first.title!) as Text).data, 'newest.pdf');
     });
 
+    testWidgets('reads legacy bare-path entries after an upgrade',
+        (tester) async {
+      // Older builds stored plain absolute paths. Upgrading must not wipe the
+      // list.
+      SharedPreferences.setMockInitialValues({
+        'recent_files': [p(['docs', 'legacy.pdf'])],
+      });
+      await pumpHome(tester);
+
+      expect(find.text('legacy.pdf'), findsOneWidget);
+    });
+
     testWidgets('removing an entry persists the removal', (tester) async {
       SharedPreferences.setMockInitialValues({
         'recent_files': [
-          p(['docs', 'a.pdf']),
-          p(['docs', 'b.pdf']),
+          refFor('a.pdf').encode(),
+          refFor('b.pdf').encode(),
         ],
       });
       await pumpHome(tester);
@@ -79,14 +99,23 @@ void main() {
       expect(find.text('b.pdf'), findsOneWidget);
 
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getStringList('recent_files'), [p(['docs', 'b.pdf'])]);
+      final remaining = (prefs.getStringList('recent_files') ?? [])
+          .map(DocumentRef.decode)
+          .whereType<DocumentRef>()
+          .toList();
+      expect(remaining, hasLength(1));
+      expect(remaining.single.name, 'b.pdf');
     });
 
     testWidgets('opening a missing file reports it and drops the entry',
         (tester) async {
-      final missing = p([Directory.systemTemp.path, 'definitely-not-here.pdf']);
       SharedPreferences.setMockInitialValues({
-        'recent_files': [missing],
+        'recent_files': [
+          const DocumentRef(
+            path: '/definitely/not/here.pdf',
+            name: 'definitely-not-here.pdf',
+          ).encode(),
+        ],
       });
       await pumpHome(tester);
 
@@ -99,16 +128,29 @@ void main() {
       expect(prefs.getStringList('recent_files'), isEmpty);
     });
 
-    testWidgets('shows the file name, not the whole path, as the title',
-        (tester) async {
-      final path = p(['a', 'deep', 'nested', 'report.pdf']);
+    testWidgets('says whether a document saves in place', (tester) async {
       SharedPreferences.setMockInitialValues({
-        'recent_files': [path],
+        'recent_files': [
+          refFor('writable.pdf', uri: 'content://x/1').encode(),
+          refFor('locked.pdf', uri: 'content://x/2', canWrite: false).encode(),
+        ],
+      });
+      await pumpHome(tester);
+
+      expect(find.text('Saves to the original file'), findsOneWidget);
+      expect(find.text('Read-only copy'), findsOneWidget);
+    });
+
+    testWidgets('shows the display name rather than an opaque URI',
+        (tester) async {
+      const uri = 'content://com.android.providers.media/document/9999';
+      SharedPreferences.setMockInitialValues({
+        'recent_files': [refFor('report.pdf', uri: uri).encode()],
       });
       await pumpHome(tester);
 
       expect(find.text('report.pdf'), findsOneWidget);
-      expect(find.text(path), findsOneWidget);
+      expect(find.textContaining(uri), findsNothing);
     });
   });
 }

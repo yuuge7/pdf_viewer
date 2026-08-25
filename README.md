@@ -72,11 +72,15 @@ If either the keystore or the credentials are missing, the release build still s
 
 CI does not use `key.properties`; it decodes the keystore from the `KEYSTORE_BASE64` secret and passes `KEYSTORE_PASSWORD`, `KEY_ALIAS`, and `KEY_PASSWORD` as environment variables, which take precedence.
 
-### Known Limitation: Saving on Android
+### Saving on Android
 
-On Android the file picker returns a **copy** of the chosen document in the app's cache directory, not the original file the user sees in their file manager. "Save" therefore overwrites that copy, and the user's original document on shared storage is left unchanged. It also means a cached path stored in Recent Files can be cleared by the system, which is why opening a recent entry sometimes reports "File no longer exists".
+Documents are opened through the Storage Access Framework (`ACTION_OPEN_DOCUMENT`), and the app takes a **persistable** read/write grant on the chosen `content://` URI. Save writes back to that URI, so edits land in the user's actual document, and the grant survives reboots so Recent Files keeps working across sessions.
 
-Use **Share** to get an edited document back out of the app. Writing back to the original location needs a Storage Access Framework round trip, which this app does not implement yet.
+A cache copy is still made for rendering, because the Syncfusion viewer needs a `File` — but it is only a working copy, never the save target.
+
+If a provider grants read but not write, the document is marked read-only, Recent Files says so, and Save redirects to **Save a copy** (`ACTION_CREATE_DOCUMENT`) rather than silently writing somewhere the user will never look.
+
+Writes are made crash-safe: the previous contents are copied aside before the target is truncated, and restored if the write fails part way through.
 
 ## CI/CD Pipeline
 
