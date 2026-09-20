@@ -71,12 +71,15 @@ void main() {
       expect(((tiles.first.title!) as Text).data, 'newest.pdf');
     });
 
-    testWidgets('reads legacy bare-path entries after an upgrade',
-        (tester) async {
+    testWidgets('reads legacy bare-path entries after an upgrade', (
+      tester,
+    ) async {
       // Older builds stored plain absolute paths. Upgrading must not wipe the
       // list.
       SharedPreferences.setMockInitialValues({
-        'recent_files': [p(['docs', 'legacy.pdf'])],
+        'recent_files': [
+          p(['docs', 'legacy.pdf']),
+        ],
       });
       await pumpHome(tester);
 
@@ -85,14 +88,16 @@ void main() {
 
     testWidgets('removing an entry persists the removal', (tester) async {
       SharedPreferences.setMockInitialValues({
-        'recent_files': [
-          refFor('a.pdf').encode(),
-          refFor('b.pdf').encode(),
-        ],
+        'recent_files': [refFor('a.pdf').encode(), refFor('b.pdf').encode()],
       });
       await pumpHome(tester);
 
-      await tester.tap(find.byIcon(Icons.close_rounded).first);
+      // The home screen scrolls, and the recents list sits below the fold on
+      // a test-sized viewport, so the tile has to be brought into view first.
+      final removeButton = find.byIcon(Icons.close_rounded).first;
+      await tester.ensureVisible(removeButton);
+      await tester.pumpAndSettle();
+      await tester.tap(removeButton);
       await tester.pumpAndSettle();
 
       expect(find.text('a.pdf'), findsNothing);
@@ -107,8 +112,9 @@ void main() {
       expect(remaining.single.name, 'b.pdf');
     });
 
-    testWidgets('opening a missing file reports it and drops the entry',
-        (tester) async {
+    testWidgets('opening a missing file reports it and drops the entry', (
+      tester,
+    ) async {
       SharedPreferences.setMockInitialValues({
         'recent_files': [
           const DocumentRef(
@@ -119,6 +125,8 @@ void main() {
       });
       await pumpHome(tester);
 
+      await tester.ensureVisible(find.text('definitely-not-here.pdf'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('definitely-not-here.pdf'));
       await tester.pumpAndSettle();
 
@@ -141,8 +149,9 @@ void main() {
       expect(find.text('Read-only copy'), findsOneWidget);
     });
 
-    testWidgets('shows the display name rather than an opaque URI',
-        (tester) async {
+    testWidgets('shows the display name rather than an opaque URI', (
+      tester,
+    ) async {
       const uri = 'content://com.android.providers.media/document/9999';
       SharedPreferences.setMockInitialValues({
         'recent_files': [refFor('report.pdf', uri: uri).encode()],

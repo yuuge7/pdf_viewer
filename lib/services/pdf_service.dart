@@ -136,8 +136,9 @@ class PdfService {
           ),
         )
         .toList(growable: false);
-    final List<Rect> rects =
-        highlights.map((h) => h.bounds).toList(growable: false);
+    final List<Rect> rects = highlights
+        .map((h) => h.bounds)
+        .toList(growable: false);
 
     return Isolate.run(() async {
       final PdfDocument document = PdfDocument(inputBytes: bytes);
@@ -196,18 +197,117 @@ class PdfService {
           final List<Offset> simplified = simplifyStroke(stroke.points);
           if (simplified.length < 2) continue;
 
-          final PdfPen pen = PdfPen(
-            PdfColor(stroke.r, stroke.g, stroke.b),
-            width: stroke.width,
-          )
-            ..lineCap = PdfLineCap.round
-            ..lineJoin = PdfLineJoin.round;
+          final PdfPen pen =
+              PdfPen(
+                  PdfColor(stroke.r, stroke.g, stroke.b),
+                  width: stroke.width,
+                )
+                ..lineCap = PdfLineCap.round
+                ..lineJoin = PdfLineJoin.round;
 
           final PdfPath path = PdfPath();
           for (int i = 0; i < simplified.length - 1; i++) {
             path.addLine(simplified[i], simplified[i + 1]);
           }
           page.graphics.drawPath(path, pen: pen);
+        }
+        return Uint8List.fromList(await document.save());
+      } finally {
+        document.dispose();
+      }
+    });
+  }
+
+  /// Turns [pageIndices] by [quarterTurns] clockwise quarter turns.
+  ///
+  /// Rotation is recorded in the page's `/Rotate` entry rather than by
+  /// redrawing anything, so it is lossless and costs nothing but a re-save.
+  static Future<Uint8List> renderRotatePages(
+    Uint8List bytes,
+    List<int> pageIndices,
+    int quarterTurns,
+  ) {
+    return Isolate.run(() async {
+      final PdfDocument document = PdfDocument(inputBytes: bytes);
+      try {
+        for (final int pageIndex in pageIndices) {
+          _requirePageInRange(document, pageIndex);
+        }
+        for (final int pageIndex in pageIndices) {
+          final PdfPage page = document.pages[pageIndex];
+          final int turns =
+              (((page.rotation.index + quarterTurns) % 4) + 4) % 4;
+          page.rotation = PdfPageRotateAngle.values[turns];
+        }
+        return Uint8List.fromList(await document.save());
+      } finally {
+        document.dispose();
+      }
+    });
+  }
+
+  /// Removes [pageIndices] from the document.
+  static Future<Uint8List> renderDeletePages(
+    Uint8List bytes,
+    List<int> pageIndices,
+  ) {
+    return Isolate.run(() async {
+      final PdfDocument document = PdfDocument(inputBytes: bytes);
+      try {
+        for (final int pageIndex in pageIndices) {
+          _requirePageInRange(document, pageIndex);
+        }
+        final Set<int> unique = pageIndices.toSet();
+        if (unique.length >= document.pages.count) {
+          throw const PdfEditException(
+            'A document must keep at least one page.',
+          );
+        }
+        // Descending, so removing one page does not shift the index of the
+        // next one still to be removed.
+        final List<int> ordered = unique.toList()
+          ..sort((a, b) => b.compareTo(a));
+        for (final int pageIndex in ordered) {
+          document.pages.removeAt(pageIndex);
+        }
+        return Uint8List.fromList(await document.save());
+      } finally {
+        document.dispose();
+      }
+    });
+  }
+
+  /// Appends [images] as new pages, each sized to its own aspect ratio.
+  static Future<Uint8List> renderAppendImages(
+    Uint8List bytes,
+    List<Uint8List> images,
+  ) {
+    return Isolate.run(() async {
+      final PdfDocument document = PdfDocument(inputBytes: bytes);
+      try {
+        if (images.isEmpty) {
+          throw const PdfEditException('No pages to add.');
+        }
+        for (final Uint8List imageBytes in images) {
+          final PdfBitmap bitmap = PdfBitmap(imageBytes);
+          const double longEdge = 842.0;
+          final double scale =
+              longEdge /
+              (bitmap.width > bitmap.height ? bitmap.width : bitmap.height);
+          final Size sheet = Size(bitmap.width * scale, bitmap.height * scale);
+          // `insert` with an explicit size rather than `add`: page settings on
+          // a document are frozen once it has a page and are normalised to its
+          // orientation, so added pages would inherit the original document's
+          // size and margins instead of matching the image.
+          final PdfPage page = document.pages.insert(
+            document.pages.count,
+            sheet,
+            PdfMargins()..all = 0,
+          );
+          page.graphics.drawImage(
+            bitmap,
+            Rect.fromLTWH(0, 0, sheet.width, sheet.height),
+          );
         }
         return Uint8List.fromList(await document.save());
       } finally {
@@ -284,6 +384,34 @@ class PdfService {
       file,
       'draw',
       (bytes) => renderDrawAnnotation(bytes, pageIndex, strokes),
+    );
+  }
+
+  static Future<PdfEditResult> rotatePages(
+    File file,
+    List<int> pageIndices,
+    int quarterTurns,
+  ) {
+    return _edit(
+      file,
+      'rotate',
+      (bytes) => renderRotatePages(bytes, pageIndices, quarterTurns),
+    );
+  }
+
+  static Future<PdfEditResult> deletePages(File file, List<int> pageIndices) {
+    return _edit(
+      file,
+      'delete pages',
+      (bytes) => renderDeletePages(bytes, pageIndices),
+    );
+  }
+
+  static Future<PdfEditResult> appendImages(File file, List<Uint8List> images) {
+    return _edit(
+      file,
+      'add pages',
+      (bytes) => renderAppendImages(bytes, images),
     );
   }
 

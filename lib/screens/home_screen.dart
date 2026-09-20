@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/document_service.dart';
 import '../services/recent_documents.dart';
+import '../services/scan_service.dart';
 import 'pdf_editor_screen.dart';
+import 'scan_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -15,10 +19,41 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   List<DocumentRef> _recentFiles = [];
 
+  StreamSubscription<DocumentRef>? _incoming;
+
+  /// True while the editor is already on screen, so a second "Open with"
+  /// intent does not stack another editor on top of it.
+  bool _isEditorOpen = false;
+
   @override
   void initState() {
     super.initState();
     _loadRecentFiles();
+    _incoming = DocumentService.incoming.listen(_openIncoming);
+    _consumeLaunchDocument();
+  }
+
+  @override
+  void dispose() {
+    _incoming?.cancel();
+    super.dispose();
+  }
+
+  /// Opens the document the app was launched with, if another app handed it
+  /// one through "Open with".
+  Future<void> _consumeLaunchDocument() async {
+    final DocumentRef? launched = await DocumentService.startListening();
+    if (launched == null || !mounted) return;
+    await _openIncoming(launched);
+  }
+
+  Future<void> _openIncoming(DocumentRef ref) async {
+    if (!mounted || _isEditorOpen) return;
+    // Only documents the app holds a lasting grant on are worth remembering:
+    // the temporary grant on a shared document is gone by the next launch, and
+    // the entry would only ever resolve to "File no longer exists".
+    if (ref.canWrite) await _addRecentFile(ref);
+    await _open(ref);
   }
 
   Future<void> _loadRecentFiles() async {
@@ -41,10 +76,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _open(DocumentRef ref) async {
     if (!mounted) return;
-    await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => PdfEditorScreen(document: ref)),
-    );
+    _isEditorOpen = true;
+    try {
+      await Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => PdfEditorScreen(document: ref)),
+      );
+    } finally {
+      _isEditorOpen = false;
+    }
+    if (!mounted) return;
     // The document may have been saved while it was open.
     await _loadRecentFiles();
   }
@@ -57,9 +98,9 @@ class _HomeScreenState extends State<HomeScreen> {
       final DocumentRef? resolved = await DocumentService.reopen(ref);
       if (!mounted) return;
       if (resolved == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('File no longer exists')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('File no longer exists')));
         await _removeRecentFile(ref);
         return;
       }
@@ -67,9 +108,8 @@ class _HomeScreenState extends State<HomeScreen> {
       await _open(resolved);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not open: $e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Could not open: $e')));
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -84,12 +124,27 @@ class _HomeScreenState extends State<HomeScreen> {
       await _open(ref);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error selecting file: $e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Error selecting file: $e')));
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  /// Runs a scan session and opens whatever it produced.
+  ///
+  /// The session saves through the system picker itself and records the
+  /// result in Recent Files, so there is nothing to add here — only the list
+  /// on screen needs refreshing.
+  Future<void> _scan(ScanSource source) async {
+    final DocumentRef? created = await ScanScreen.createDocument(
+      context,
+      source: source,
+    );
+    if (!mounted) return;
+    await _loadRecentFiles();
+    if (created == null || !mounted) return;
+    await _open(created);
   }
 
   @override
@@ -127,6 +182,30 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 40),
               _buildOpenCard(theme),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildQuickAction(
+                      theme,
+                      icon: Icons.document_scanner_rounded,
+                      title: 'Scan',
+                      subtitle: 'Camera to PDF',
+                      onTap: () => _scan(ScanSource.camera),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildQuickAction(
+                      theme,
+                      icon: Icons.photo_library_rounded,
+                      title: 'Images',
+                      subtitle: 'Photos to PDF',
+                      onTap: () => _scan(ScanSource.gallery),
+                    ),
+                  ),
+                ],
+              ),
               const SizedBox(height: 40),
               Text(
                 'Recent Files',
@@ -180,7 +259,11 @@ class _HomeScreenState extends State<HomeScreen> {
             if (_isLoading)
               const CircularProgressIndicator(color: Colors.white)
             else
-              const Icon(Icons.upload_file_rounded, size: 64, color: Colors.white),
+              const Icon(
+                Icons.upload_file_rounded,
+                size: 64,
+                color: Colors.white,
+              ),
             const SizedBox(height: 16),
             Text(
               'Open a Document',
@@ -194,6 +277,58 @@ class _HomeScreenState extends State<HomeScreen> {
               'Tap to select a PDF from your device',
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: Colors.white.withValues(alpha: 0.8),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQuickAction(
+    ThemeData theme, {
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: _isLoading ? null : onTap,
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 14),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest.withValues(
+            alpha: 0.5,
+          ),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: theme.colorScheme.primary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ),
             ),
           ],

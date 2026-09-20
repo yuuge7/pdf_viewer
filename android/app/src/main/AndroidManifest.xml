@@ -31,6 +31,18 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- Makes the app an option under "Open with" for a PDF coming
+                 from a file manager, a mail client or a browser download.
+                 MainActivity turns the intent's URI into a DocumentRef; the
+                 grant that comes with a VIEW intent is temporary and usually
+                 read-only, so such a document opens as a read-only copy. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="content" android:mimeType="application/pdf"/>
+                <data android:scheme="file" android:mimeType="application/pdf"/>
+            </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
@@ -47,6 +59,11 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Package visibility on API 30+: without this the camera app cannot
+             be resolved, and scanning silently falls back to nothing. -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE"/>
         </intent>
     </queries>
 </manifest>

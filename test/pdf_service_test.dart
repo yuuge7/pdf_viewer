@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as img;
 import 'package:pdf_viewer/services/pdf_service.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
@@ -11,10 +12,10 @@ Future<Uint8List> buildDocument(int pageCount) async {
   final PdfDocument document = PdfDocument();
   for (int i = 0; i < pageCount; i++) {
     document.pages.add().graphics.drawString(
-          'MARKER${i + 1}',
-          PdfStandardFont(PdfFontFamily.helvetica, 20),
-          bounds: const Rect.fromLTWH(40, 40, 300, 40),
-        );
+      'MARKER${i + 1}',
+      PdfStandardFont(PdfFontFamily.helvetica, 20),
+      bounds: const Rect.fromLTWH(40, 40, 300, 40),
+    );
   }
   final bytes = Uint8List.fromList(await document.save());
   document.dispose();
@@ -38,6 +39,40 @@ int annotationCountOnPage(Uint8List bytes, int pageIndex) {
   } finally {
     document.dispose();
   }
+}
+
+PdfPageRotateAngle rotationOfPage(Uint8List bytes, int pageIndex) {
+  final PdfDocument document = PdfDocument(inputBytes: bytes);
+  try {
+    return document.pages[pageIndex].rotation;
+  } finally {
+    document.dispose();
+  }
+}
+
+int pageCountOf(Uint8List bytes) {
+  final PdfDocument document = PdfDocument(inputBytes: bytes);
+  try {
+    return document.pages.count;
+  } finally {
+    document.dispose();
+  }
+}
+
+Size pageSizeOf(Uint8List bytes, int pageIndex) {
+  final PdfDocument document = PdfDocument(inputBytes: bytes);
+  try {
+    return document.pages[pageIndex].size;
+  } finally {
+    document.dispose();
+  }
+}
+
+/// A small JPEG of known proportions, standing in for a rendered scan.
+Uint8List jpegOf(int width, int height) {
+  final img.Image image = img.Image(width: width, height: height);
+  img.fill(image, color: img.ColorRgb8(200, 200, 200));
+  return img.encodeJpg(image);
 }
 
 void main() {
@@ -107,19 +142,21 @@ void main() {
       );
     });
 
-    test('keeps text drawn near the right edge instead of clipping it',
-        () async {
-      final source = await buildDocument(1);
-      final edited = await PdfService.renderTextAnnotation(
-        source,
-        0,
-        'EDGE',
-        const Offset(500, 300),
-        Colors.black,
-        12,
-      );
-      expect(textOnPage(edited, 0), contains('EDGE'));
-    });
+    test(
+      'keeps text drawn near the right edge instead of clipping it',
+      () async {
+        final source = await buildDocument(1);
+        final edited = await PdfService.renderTextAnnotation(
+          source,
+          0,
+          'EDGE',
+          const Offset(500, 300),
+          Colors.black,
+          12,
+        );
+        expect(textOnPage(edited, 0), contains('EDGE'));
+      },
+    );
   });
 
   group('renderHighlightAnnotation', () {
@@ -181,17 +218,13 @@ void main() {
   group('renderDrawAnnotation', () {
     test('produces a document that still parses and grows in size', () async {
       final source = await buildDocument(2);
-      final edited = await PdfService.renderDrawAnnotation(
-        source,
-        1,
-        [
-          DrawStroke(
-            points: List.generate(60, (i) => Offset(50.0 + i * 3, 100.0 + i)),
-            color: Colors.blue,
-            width: 3,
-          ),
-        ],
-      );
+      final edited = await PdfService.renderDrawAnnotation(source, 1, [
+        DrawStroke(
+          points: List.generate(60, (i) => Offset(50.0 + i * 3, 100.0 + i)),
+          color: Colors.blue,
+          width: 3,
+        ),
+      ]);
 
       expect(edited.length, greaterThan(source.length));
       // Content is intact and nothing leaked onto the other page.
@@ -201,17 +234,13 @@ void main() {
 
     test('ignores strokes with fewer than two points', () async {
       final source = await buildDocument(1);
-      final edited = await PdfService.renderDrawAnnotation(
-        source,
-        0,
-        [
-          DrawStroke(
-            points: const [Offset(10, 10)],
-            color: Colors.blue,
-            width: 2,
-          ),
-        ],
-      );
+      final edited = await PdfService.renderDrawAnnotation(source, 0, [
+        DrawStroke(
+          points: const [Offset(10, 10)],
+          color: Colors.blue,
+          width: 2,
+        ),
+      ]);
       expect(() => textOnPage(edited, 0), returnsNormally);
     });
 
@@ -262,6 +291,129 @@ void main() {
       // rather than collapsing to nothing.
       final tiny = List.generate(20, (i) => Offset(i * 0.01, 0));
       expect(PdfService.simplifyStroke(tiny).length, greaterThanOrEqualTo(2));
+    });
+  });
+
+  group('renderRotatePages', () {
+    test('turns only the pages it was given', () async {
+      final source = await buildDocument(3);
+      final edited = await PdfService.renderRotatePages(source, [1], 1);
+
+      expect(rotationOfPage(edited, 0), PdfPageRotateAngle.rotateAngle0);
+      expect(rotationOfPage(edited, 1), PdfPageRotateAngle.rotateAngle90);
+      expect(rotationOfPage(edited, 2), PdfPageRotateAngle.rotateAngle0);
+    });
+
+    test('accumulates on top of the rotation already there', () async {
+      final source = await buildDocument(1);
+      final once = await PdfService.renderRotatePages(source, [0], 1);
+      final twice = await PdfService.renderRotatePages(once, [0], 1);
+
+      expect(rotationOfPage(twice, 0), PdfPageRotateAngle.rotateAngle180);
+    });
+
+    test('wraps back round rather than running off the end', () async {
+      Uint8List bytes = await buildDocument(1);
+      for (int i = 0; i < 4; i++) {
+        bytes = await PdfService.renderRotatePages(bytes, [0], 1);
+      }
+
+      expect(rotationOfPage(bytes, 0), PdfPageRotateAngle.rotateAngle0);
+    });
+
+    test('rejects an out-of-range page before changing anything', () async {
+      final source = await buildDocument(2);
+
+      await expectLater(
+        PdfService.renderRotatePages(source, [0, 5], 1),
+        throwsA(isA<PdfEditException>()),
+      );
+    });
+  });
+
+  group('renderDeletePages', () {
+    test('removes the requested pages and keeps the rest in order', () async {
+      final source = await buildDocument(4);
+      final edited = await PdfService.renderDeletePages(source, [0, 2]);
+
+      expect(pageCountOf(edited), 2);
+      expect(textOnPage(edited, 0), contains('MARKER2'));
+      expect(textOnPage(edited, 1), contains('MARKER4'));
+    });
+
+    test('handles indices given out of order', () async {
+      final source = await buildDocument(4);
+      final edited = await PdfService.renderDeletePages(source, [3, 1]);
+
+      expect(pageCountOf(edited), 2);
+      expect(textOnPage(edited, 0), contains('MARKER1'));
+      expect(textOnPage(edited, 1), contains('MARKER3'));
+    });
+
+    test('ignores a repeated index rather than deleting twice', () async {
+      final source = await buildDocument(3);
+      final edited = await PdfService.renderDeletePages(source, [1, 1]);
+
+      expect(pageCountOf(edited), 2);
+      expect(textOnPage(edited, 0), contains('MARKER1'));
+      expect(textOnPage(edited, 1), contains('MARKER3'));
+    });
+
+    test('refuses to empty the document', () async {
+      final source = await buildDocument(2);
+
+      await expectLater(
+        PdfService.renderDeletePages(source, [0, 1]),
+        throwsA(isA<PdfEditException>()),
+      );
+    });
+
+    test('rejects an out-of-range page', () async {
+      final source = await buildDocument(2);
+
+      await expectLater(
+        PdfService.renderDeletePages(source, [7]),
+        throwsA(isA<PdfEditException>()),
+      );
+    });
+  });
+
+  group('renderAppendImages', () {
+    test('adds one page per image, after the existing ones', () async {
+      final source = await buildDocument(2);
+      final edited = await PdfService.renderAppendImages(source, [
+        jpegOf(200, 300),
+        jpegOf(300, 200),
+      ]);
+
+      expect(pageCountOf(edited), 4);
+      expect(textOnPage(edited, 0), contains('MARKER1'));
+      expect(textOnPage(edited, 1), contains('MARKER2'));
+    });
+
+    test('shapes each added page to its own image', () async {
+      // A4 pages in, one portrait and one landscape scan appended: each added
+      // page has to take the proportions of its image rather than inheriting
+      // the document's.
+      final source = await buildDocument(1);
+      final edited = await PdfService.renderAppendImages(source, [
+        jpegOf(200, 400),
+        jpegOf(400, 200),
+      ]);
+
+      final Size portrait = pageSizeOf(edited, 1);
+      final Size landscape = pageSizeOf(edited, 2);
+      expect(portrait.height / portrait.width, closeTo(2.0, 0.05));
+      expect(landscape.width / landscape.height, closeTo(2.0, 0.05));
+    });
+
+    test('rejects an empty batch', () async {
+      final source = await buildDocument(1);
+
+      await expectLater(
+        PdfService.renderAppendImages(source, []),
+        throwsA(isA<PdfEditException>()),
+      );
     });
   });
 

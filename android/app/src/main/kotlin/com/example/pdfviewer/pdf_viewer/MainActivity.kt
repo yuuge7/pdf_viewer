@@ -45,16 +45,55 @@ class MainActivity : FlutterActivity() {
     /** Bytes waiting to be written once ACTION_CREATE_DOCUMENT returns a URI. */
     private var pendingCreateSource: String? = null
 
+    /**
+     * A document the app was launched with, held until Dart asks for it.
+     *
+     * An ACTION_VIEW intent arrives in onCreate, well before the Dart entry
+     * point is running, so it cannot simply be pushed over the channel.
+     */
+    private var launchUri: Uri? = null
+
+    private var channel: MethodChannel? = null
+
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result -> onMethodCall(call, result) }
+        channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+            .apply { setMethodCallHandler { call, result -> onMethodCall(call, result) } }
+        launchUri = viewUriOf(intent)
+    }
+
+    /**
+     * A second PDF opened while the app is already running.
+     *
+     * The activity is singleTop, so this replaces onCreate rather than
+     * starting a new instance; Dart is alive by now, so the document is
+     * pushed straight over the channel.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val uri = viewUriOf(intent) ?: return
+        worker.execute {
+            try {
+                val payload = describe(uri)
+                main.post { channel?.invokeMethod("documentOpened", payload) }
+            } catch (e: Exception) {
+                // Nothing to open; the app simply stays where it was.
+            }
+        }
+    }
+
+    private fun viewUriOf(intent: Intent?): Uri? {
+        if (intent?.action != Intent.ACTION_VIEW) return null
+        return intent.data
     }
 
     override fun onDestroy() {
+        channel?.setMethodCallHandler(null)
+        channel = null
         worker.shutdown()
         super.onDestroy()
     }
@@ -72,6 +111,15 @@ class MainActivity : FlutterActivity() {
                 writeDocument(call.argument<String>("uri")!!, call.argument<String>("sourcePath")!!)
             }
             "canWrite" -> result.success(canWrite(call.argument<String>("uri")!!))
+            "consumeLaunchDocument" -> {
+                val uri = launchUri
+                launchUri = null
+                if (uri == null) {
+                    result.success(null)
+                } else {
+                    onWorker(result) { describe(uri) }
+                }
+            }
             "displayName" -> onWorker(result) { displayName(Uri.parse(call.argument<String>("uri")!!)) }
             "releaseDocument" -> {
                 releasePermission(call.argument<String>("uri")!!)
@@ -196,6 +244,36 @@ class MainActivity : FlutterActivity() {
                 main.post { result.error("failed", e.message, null) }
             }
         }
+    }
+
+    /**
+     * Builds the Dart-side description of a document, caching a copy for the
+     * viewer to render.
+     *
+     * A VIEW intent carries a one-shot grant, so the persistable upgrade is
+     * attempted and allowed to fail: the document still opens for this
+     * session, it just reports itself as not writable, which is what makes the
+     * editor steer the user to Save a copy instead of writing nowhere.
+     */
+    private fun describe(uri: Uri): Map<String, Any?> {
+        try {
+            contentResolver.takePersistableUriPermission(uri, PERSISTABLE_FLAGS)
+        } catch (_: SecurityException) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Temporary grant only; good for this session.
+            }
+        }
+        return mapOf(
+            "uri" to uri.toString(),
+            "name" to displayName(uri),
+            "path" to copyToCache(uri.toString()),
+            "canWrite" to canWrite(uri.toString())
+        )
     }
 
     // --- Reading and writing -------------------------------------------------

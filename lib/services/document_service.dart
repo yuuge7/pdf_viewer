@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -34,11 +35,11 @@ class DocumentRef {
   bool get savesInPlace => uri != null ? canWrite : true;
 
   Map<String, dynamic> toJson() => {
-        'uri': uri,
-        'path': path,
-        'name': name,
-        'canWrite': canWrite,
-      };
+    'uri': uri,
+    'path': path,
+    'name': name,
+    'canWrite': canWrite,
+  };
 
   static DocumentRef? fromJson(Map<String, dynamic> json) {
     final path = json['path'];
@@ -74,11 +75,11 @@ class DocumentRef {
   }
 
   DocumentRef copyWith({String? path, bool? canWrite}) => DocumentRef(
-        path: path ?? this.path,
-        name: name,
-        uri: uri,
-        canWrite: canWrite ?? this.canWrite,
-      );
+    path: path ?? this.path,
+    name: name,
+    uri: uri,
+    canWrite: canWrite ?? this.canWrite,
+  );
 
   /// Recent Files identity. Two cache copies of the same document share a URI
   /// but not a path, so the URI is the stable key where there is one.
@@ -89,6 +90,56 @@ class DocumentRef {
 class DocumentService {
   static const MethodChannel _channel = MethodChannel('propdf/documents');
 
+  /// Documents handed to the app by another app ("Open with").
+  ///
+  /// The launch intent is consumed once at startup; later ones arrive here as
+  /// the platform pushes them, because the activity is singleTop and does not
+  /// restart for a second document.
+  static final StreamController<DocumentRef> _incoming =
+      StreamController<DocumentRef>.broadcast();
+
+  static Stream<DocumentRef> get incoming => _incoming.stream;
+
+  static bool _listening = false;
+
+  /// Starts relaying documents opened from other apps, and returns the one the
+  /// app was launched with, if any.
+  ///
+  /// Safe to call more than once; only the first call installs the handler.
+  static Future<DocumentRef?> startListening() async {
+    if (!supportsSaf) return null;
+    if (!_listening) {
+      _listening = true;
+      _channel.setMethodCallHandler((call) async {
+        if (call.method != 'documentOpened') return null;
+        final DocumentRef? ref = _refFrom(call.arguments);
+        if (ref != null) _incoming.add(ref);
+        return null;
+      });
+    }
+    try {
+      final Map<String, dynamic>? launch = await _channel
+          .invokeMapMethod<String, dynamic>('consumeLaunchDocument');
+      return _refFrom(launch);
+    } on PlatformException {
+      return null;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  static DocumentRef? _refFrom(Object? payload) {
+    if (payload is! Map) return null;
+    final Object? path = payload['path'];
+    if (path is! String) return null;
+    return DocumentRef(
+      uri: payload['uri'] as String?,
+      path: path,
+      name: payload['name'] as String? ?? 'document.pdf',
+      canWrite: payload['canWrite'] as bool? ?? false,
+    );
+  }
+
   /// Whether the Storage Access Framework path is available. Everything else
   /// falls back to `file_picker`, which cannot write back to the original.
   static bool get supportsSaf => !kIsWeb && Platform.isAndroid;
@@ -96,7 +147,9 @@ class DocumentService {
   /// Opens the system document picker. Returns null if the user cancelled.
   static Future<DocumentRef?> pick() async {
     if (supportsSaf) {
-      final result = await _channel.invokeMapMethod<String, dynamic>('pickDocument');
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'pickDocument',
+      );
       if (result == null) return null;
       return DocumentRef(
         uri: result['uri'] as String?,
@@ -113,10 +166,7 @@ class DocumentService {
     if (picked.isEmpty) return null;
     final path = picked.first.path;
     if (path == null) return null;
-    return DocumentRef(
-      path: path,
-      name: picked.first.name,
-    );
+    return DocumentRef(path: path, name: picked.first.name);
   }
 
   /// Re-opens a document from a stored reference, refreshing its cache copy.
@@ -136,9 +186,12 @@ class DocumentService {
       return ref.file.existsSync() ? ref : null;
     }
     try {
-      final path = await _channel.invokeMethod<String>('copyToCache', {'uri': uri});
+      final path = await _channel.invokeMethod<String>('copyToCache', {
+        'uri': uri,
+      });
       if (path == null) return null;
-      final canWrite = await _channel.invokeMethod<bool>('canWrite', {'uri': uri}) ?? false;
+      final canWrite =
+          await _channel.invokeMethod<bool>('canWrite', {'uri': uri}) ?? false;
       return ref.copyWith(path: path, canWrite: canWrite);
     } on PlatformException {
       return null;
@@ -160,12 +213,15 @@ class DocumentService {
 
   /// Prompts for a location and saves a copy there. Returns the new reference,
   /// or null if the user cancelled.
-  static Future<DocumentRef?> saveCopy(String suggestedName, File source) async {
+  static Future<DocumentRef?> saveCopy(
+    String suggestedName,
+    File source,
+  ) async {
     if (!supportsSaf) return null;
-    final result = await _channel.invokeMapMethod<String, dynamic>('createDocument', {
-      'name': suggestedName,
-      'sourcePath': source.path,
-    });
+    final result = await _channel.invokeMapMethod<String, dynamic>(
+      'createDocument',
+      {'name': suggestedName, 'sourcePath': source.path},
+    );
     if (result == null) return null;
     return DocumentRef(
       uri: result['uri'] as String?,

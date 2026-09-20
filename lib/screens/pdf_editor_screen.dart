@@ -1,17 +1,22 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' show PointMode;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:syncfusion_flutter_pdf/pdf.dart' show PdfPage, PdfPageRotateAngle;
+import 'package:syncfusion_flutter_pdf/pdf.dart'
+    show PdfPage, PdfPageRotateAngle;
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
 import '../services/document_service.dart';
 import '../services/pdf_page_geometry.dart';
 import '../services/pdf_service.dart';
 import '../services/recent_documents.dart';
+import '../services/scan_service.dart';
 import '../widgets/page_thumbnails.dart';
+import 'scan_screen.dart';
 
 enum EditTool { none, text, highlight, draw }
 
@@ -23,19 +28,23 @@ const double kPageSpacing = 4.0;
 
 /// A stroke the user has drawn but not yet written into the PDF.
 ///
-/// Both representations are kept: [screenPoints] drives the live preview
-/// overlay, [pagePoints] is what gets written. The mapping is done at the
-/// moment the stroke is finished, while the viewer transform is guaranteed to
-/// be the one the user drew against.
+/// Two representations are kept: [scenePoints] drives the live preview
+/// overlay, [pagePoints] is what gets written. Both are resolved the moment
+/// the stroke is finished, while the viewer transform is guaranteed to be the
+/// one the user drew against.
+///
+/// The preview is stored in *scene* space, not screen space, so that panning
+/// or zooming with pending work on screen moves the preview with the page
+/// instead of leaving it pinned to the glass.
 class _PendingStroke {
-  final List<Offset> screenPoints;
+  final List<Offset> scenePoints;
   final List<Offset> pagePoints;
   final int pageIndex;
   final Color color;
   final double width;
 
   const _PendingStroke({
-    required this.screenPoints,
+    required this.scenePoints,
     required this.pagePoints,
     required this.pageIndex,
     required this.color,
@@ -45,13 +54,13 @@ class _PendingStroke {
 
 /// A highlight the user has drawn but not yet written into the PDF.
 class _PendingHighlight {
-  final Rect screenBounds;
+  final Rect sceneBounds;
   final Rect pageBounds;
   final int pageIndex;
   final Color color;
 
   const _PendingHighlight({
-    required this.screenBounds,
+    required this.sceneBounds,
     required this.pageBounds,
     required this.pageIndex,
     required this.color,
@@ -67,7 +76,8 @@ class PdfEditorScreen extends StatefulWidget {
   State<PdfEditorScreen> createState() => _PdfEditorScreenState();
 }
 
-class _PdfEditorScreenState extends State<PdfEditorScreen> {
+class _PdfEditorScreenState extends State<PdfEditorScreen>
+    with SingleTickerProviderStateMixin {
   late File _currentFile;
   PdfViewerController _pdfViewerController = PdfViewerController();
   GlobalKey<SfPdfViewerState> _pdfViewerKey = GlobalKey();
@@ -81,10 +91,32 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   final TextEditingController _searchController = TextEditingController();
   PdfTextSearchResult? _searchResult;
 
+  /// The term currently being searched for.
+  ///
+  /// A search belongs to the controller that ran it, so applying an edit —
+  /// which replaces the viewer — drops the results. Keeping the term lets the
+  /// search be re-run against the new document instead of leaving the search
+  /// bar open over nothing.
+  String _searchQuery = '';
+
   EditTool _activeTool = EditTool.none;
   List<Offset> _currentDrawing = [];
   final List<_PendingStroke> _pendingDrawStrokes = [];
   final List<_PendingHighlight> _pendingHighlights = [];
+
+  /// While true the drawing overlay stops taking input, so the viewer's own
+  /// pan and pinch reach it.
+  ///
+  /// A full-screen gesture overlay has to claim every touch to draw with one,
+  /// which left no way to scroll to the next page without putting the tool
+  /// away — and putting the tool away flushes the batch. An explicit toggle
+  /// keeps both possible and keeps which one is active unambiguous.
+  bool _panMode = false;
+
+  /// Bumped once per frame while there is pending work to keep on screen
+  /// during a pan, since the viewer reports scrolling to nobody.
+  final ValueNotifier<int> _overlayTick = ValueNotifier<int>(0);
+  late final Ticker _overlayTicker;
 
   Offset? _textPosition;
   PdfPagePoint? _textTarget;
@@ -98,6 +130,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   /// MediaQuery, which reports the whole screen including the app bar and
   /// bottom bar insets.
   double _viewportWidth = 0;
+
+  /// Laid-out height of the viewer, used to keep the text entry box on screen.
+  double _viewportHeight = 0;
 
   /// Size of every page *as displayed*, captured on load. Pages in a document
   /// are not necessarily uniform, and assuming they are misplaces annotations.
@@ -122,17 +157,35 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     _currentFile = widget.document.file;
     _savedPath = _currentFile.path;
     _history.add(_currentFile);
+    _overlayTicker = createTicker((_) => _overlayTick.value++);
     _sweepStaleTempFiles();
   }
 
   @override
   void dispose() {
+    _overlayTicker.dispose();
+    _overlayTick.dispose();
     _searchResult?.removeListener(_onSearchResultChanged);
     _searchResult?.clear();
     _searchController.dispose();
     _textOverlayController.dispose();
     _pdfViewerController.dispose();
     super.dispose();
+  }
+
+  bool get _hasPendingAnnotations =>
+      _pendingDrawStrokes.isNotEmpty || _pendingHighlights.isNotEmpty;
+
+  /// Runs the per-frame repaint only while it actually buys something: a
+  /// pending preview that has to track a view the user is moving.
+  void _syncOverlayTicker() {
+    final bool shouldTick = _panMode && _hasPendingAnnotations;
+    if (shouldTick == _overlayTicker.isActive) return;
+    if (shouldTick) {
+      _overlayTicker.start();
+    } else {
+      _overlayTicker.stop();
+    }
   }
 
   /// Deletes edit scratch files left behind by previous sessions.
@@ -146,8 +199,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
       // Sweeping the opened document's own folder would both miss the scratch
       // files and risk deleting the user's files that happen to match.
       final Directory directory = await getApplicationDocumentsDirectory();
-      final DateTime cutoff =
-          DateTime.now().subtract(const Duration(days: 1));
+      final DateTime cutoff = DateTime.now().subtract(const Duration(days: 1));
       await for (final FileSystemEntity entity in directory.list()) {
         if (entity is! File) continue;
         final String name = entity.uri.pathSegments.last;
@@ -235,14 +287,18 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
     final PdfEditResult result = await _applyPerPage(
       byPage.keys,
-      (file, pageIndex) =>
-          PdfService.addHighlightAnnotation(file, pageIndex, byPage[pageIndex]!),
+      (file, pageIndex) => PdfService.addHighlightAnnotation(
+        file,
+        pageIndex,
+        byPage[pageIndex]!,
+      ),
     );
 
     if (!mounted) return;
     // Only discard the pending work once it is safely in the document.
     if (result.isSuccess) _pendingHighlights.clear();
     _handleResult(result, 'Highlight added');
+    _syncOverlayTicker();
   }
 
   Future<void> _commitPendingDrawStrokes() async {
@@ -251,12 +307,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
     final Map<int, List<DrawStroke>> byPage = {};
     for (final _PendingStroke s in _pendingDrawStrokes) {
-      byPage.putIfAbsent(s.pageIndex, () => []).add(
-            DrawStroke(
-              points: s.pagePoints,
-              color: s.color,
-              width: s.width,
-            ),
+      byPage
+          .putIfAbsent(s.pageIndex, () => [])
+          .add(
+            DrawStroke(points: s.pagePoints, color: s.color, width: s.width),
           );
     }
 
@@ -269,6 +323,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     if (!mounted) return;
     if (result.isSuccess) _pendingDrawStrokes.clear();
     _handleResult(result, 'Drawing added');
+    _syncOverlayTicker();
   }
 
   /// Applies [operation] once per page, chaining the output of each step into
@@ -294,6 +349,18 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
     await _deleteAll(intermediates);
     return PdfEditResult.success(source);
+  }
+
+  void _discardLastPending(List<Object> pending) {
+    if (pending.isEmpty) return;
+    setState(pending.removeLast);
+    _syncOverlayTicker();
+  }
+
+  void _discardAllPending(List<Object> pending) {
+    if (pending.isEmpty) return;
+    setState(pending.clear);
+    _syncOverlayTicker();
   }
 
   Future<void> _deleteAll(Iterable<File> files) async {
@@ -361,8 +428,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
     // Deferred: the outgoing SfPdfViewer stays mounted until the end of this
     // frame and would throw if it notified an already-disposed controller.
-    WidgetsBinding.instance
-        .addPostFrameCallback((_) => oldController.dispose());
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => oldController.dispose(),
+    );
     // Never delete the file the user opened.
     _deleteAll(orphaned.where((f) => f.path != widget.document.path));
   }
@@ -461,6 +529,87 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
       pageCount: pageCount,
       currentPage: _currentPage,
       onSelect: (page) => _pdfViewerController.jumpToPage(page),
+      onRotate: _rotatePages,
+      onDelete: _deletePages,
+      onAddPages: _addScannedPages,
+    );
+  }
+
+  // --- Page management -------------------------------------------------------
+
+  Future<void> _rotatePages(List<int> pageIndices) async {
+    if (pageIndices.isEmpty) return;
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await PdfService.rotatePages(
+      _currentFile,
+      pageIndices,
+      1,
+    );
+    if (!mounted) return;
+    _handleResult(
+      result,
+      pageIndices.length == 1
+          ? 'Page rotated'
+          : '${pageIndices.length} pages rotated',
+    );
+  }
+
+  Future<void> _deletePages(List<int> pageIndices) async {
+    if (pageIndices.isEmpty) return;
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(
+          pageIndices.length == 1
+              ? 'Delete page ${pageIndices.single + 1}?'
+              : 'Delete ${pageIndices.length} pages?',
+        ),
+        content: const Text('This can be undone until you save.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await PdfService.deletePages(
+      _currentFile,
+      pageIndices,
+    );
+    if (!mounted) return;
+    _handleResult(
+      result,
+      pageIndices.length == 1
+          ? 'Page deleted'
+          : '${pageIndices.length} pages deleted',
+    );
+  }
+
+  /// Photographs pages and appends them to the open document.
+  Future<void> _addScannedPages(ScanSource source) async {
+    final List<Uint8List>? pages = await ScanScreen.capturePages(
+      context,
+      source: source,
+    );
+    if (pages == null || pages.isEmpty || !mounted) return;
+
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await PdfService.appendImages(
+      _currentFile,
+      pages,
+    );
+    if (!mounted) return;
+    _handleResult(
+      result,
+      pages.length == 1 ? 'Page added' : '${pages.length} pages added',
     );
   }
 
@@ -473,15 +622,78 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
 
   Future<void> _sharePdf() async {
     try {
+      // The file being viewed is a scratch copy called `edited_1738…pdf` or a
+      // SAF cache copy called `open_1738…pdf`. Sharing it directly sends that
+      // name to the other app, so stage a copy under the real one first.
+      final Directory directory = await getTemporaryDirectory();
+      final Directory outbox = Directory('${directory.path}/share');
+      if (!outbox.existsSync()) await outbox.create(recursive: true);
+      final File staged = await _currentFile.copy(
+        '${outbox.path}/${_safeFileName(widget.document.name)}',
+      );
       await SharePlus.instance.share(
         ShareParams(
-          files: [XFile(_currentFile.path)],
+          files: [XFile(staged.path)],
           text: 'Here is my document from ProPDF Studio',
         ),
       );
     } catch (e) {
       _showMessage('Could not share: $e');
     }
+  }
+
+  /// Strips anything that cannot go in a file name on the way to the outbox.
+  static String _safeFileName(String name) {
+    final String cleaned = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (cleaned.isEmpty) return 'document.pdf';
+    return cleaned.toLowerCase().endsWith('.pdf') ? cleaned : '$cleaned.pdf';
+  }
+
+  /// Asks before throwing away work, and returns whether leaving may proceed.
+  ///
+  /// Backing out of the editor used to discard every edit without a word: the
+  /// user's file is only touched by Save, so everything from the session was
+  /// simply gone.
+  Future<bool> _confirmLeave() async {
+    if (!_hasUnsavedChanges && !_hasPendingAnnotations) return true;
+
+    final String? choice = await showDialog<String>(
+      context: context,
+      // Dismissing by tapping outside would otherwise mean "discard", which is
+      // the one outcome that cannot be taken back.
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Leave without saving?'),
+        content: Text(
+          _hasPendingAnnotations
+              ? 'Annotations you have drawn but not applied, and any edits '
+                    'you have not saved, will be lost.'
+              : 'Your edits have not been saved to ${widget.document.name}.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop('keep'),
+            child: const Text('Keep editing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop('discard'),
+            child: const Text('Discard'),
+          ),
+          if (widget.document.savesInPlace)
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop('save'),
+              child: const Text('Save'),
+            ),
+        ],
+      ),
+    );
+
+    if (choice == 'discard') return true;
+    if (choice == 'save' && mounted) {
+      await _savePdf();
+      return !_hasUnsavedChanges;
+    }
+    return false;
   }
 
   // --- Search ----------------------------------------------------------------
@@ -499,7 +711,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     _searchResult?.clear();
     final PdfTextSearchResult result = _pdfViewerController.searchText(value);
     result.addListener(_onSearchResultChanged);
-    setState(() => _searchResult = result);
+    setState(() {
+      _searchQuery = value;
+      _searchResult = result;
+    });
   }
 
   void _closeSearch() {
@@ -507,6 +722,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     _searchResult?.removeListener(_onSearchResultChanged);
     _searchResult?.clear();
     setState(() {
+      _searchQuery = '';
       _searchResult = null;
       _isSearching = false;
     });
@@ -533,7 +749,18 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     setState(() {
       _activeTool = newTool;
       _currentDrawing = [];
+      // Each tool starts ready to use. Leaving pan latched from a previous
+      // session with the tool made the overlay look active while swallowing
+      // nothing, which reads as the tool being broken.
+      _panMode = false;
+      // A tool change abandons a half-typed annotation; leaving the field
+      // floating over the new tool's overlay is just a stuck widget.
+      _isEnteringText = false;
+      _textPosition = null;
+      _textTarget = null;
+      _textOverlayController.clear();
     });
+    _syncOverlayTicker();
   }
 
   void _onDrawEnd() {
@@ -550,6 +777,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     }
 
     final List<Offset> screenPoints = List<Offset>.of(_currentDrawing);
+    final List<Offset> scenePoints = screenPoints
+        .map(geometry.toScene)
+        .toList(growable: false);
 
     setState(() {
       if (_activeTool == EditTool.draw) {
@@ -560,18 +790,19 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
         final double pageTop = geometry.sceneTopFor(pageIndex);
         final Size pageSize = geometry.pageSizes[pageIndex];
 
-        final List<Offset> pagePoints = screenPoints.map((p) {
-          final Offset scene = geometry.toScene(p);
-          final Offset displayPoint = Offset(
-            (scene.dx / scale).clamp(0.0, pageSize.width),
-            ((scene.dy - pageTop) / scale).clamp(0.0, pageSize.height),
-          );
-          return _toPdfSpace(pageIndex, displayPoint);
-        }).toList(growable: false);
+        final List<Offset> pagePoints = scenePoints
+            .map((scene) {
+              final Offset displayPoint = Offset(
+                (scene.dx / scale).clamp(0.0, pageSize.width),
+                ((scene.dy - pageTop) / scale).clamp(0.0, pageSize.height),
+              );
+              return _toPdfSpace(pageIndex, displayPoint);
+            })
+            .toList(growable: false);
 
         _pendingDrawStrokes.add(
           _PendingStroke(
-            screenPoints: screenPoints,
+            scenePoints: scenePoints,
             pagePoints: pagePoints,
             pageIndex: pageIndex,
             color: _selectedDrawColor,
@@ -583,7 +814,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
         final PdfPageRect mapped = geometry.resolveRect(screenBounds);
         _pendingHighlights.add(
           _PendingHighlight(
-            screenBounds: screenBounds,
+            sceneBounds: Rect.fromPoints(
+              geometry.toScene(screenBounds.topLeft),
+              geometry.toScene(screenBounds.bottomRight),
+            ),
             pageBounds: _rectToPdfSpace(mapped.pageIndex, mapped.bounds),
             pageIndex: mapped.pageIndex,
             color: _selectedHighlightColor,
@@ -592,6 +826,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
       }
       _currentDrawing = [];
     });
+    _syncOverlayTicker();
   }
 
   static PdfPageTurn _turnOf(PdfPage page) {
@@ -645,9 +880,21 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     final theme = Theme.of(context);
     final bool isDrawingTool =
         _activeTool == EditTool.draw || _activeTool == EditTool.highlight;
-    final bool hasPending =
-        _pendingDrawStrokes.isNotEmpty || _pendingHighlights.isNotEmpty;
 
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        if (await _confirmLeave() && mounted) {
+          if (!context.mounted) return;
+          Navigator.of(context).pop();
+        }
+      },
+      child: _buildScaffold(theme, isDrawingTool),
+    );
+  }
+
+  Widget _buildScaffold(ThemeData theme, bool isDrawingTool) {
     return Scaffold(
       appBar: AppBar(
         title: _isSearching ? _buildSearchField() : _buildTitle(),
@@ -658,6 +905,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
           // The viewer fills the Stack, so these constraints are exactly the
           // ones SfPdfViewer lays its pages out against.
           _viewportWidth = constraints.maxWidth;
+          _viewportHeight = constraints.maxHeight;
           return Stack(
             children: [
               SfPdfViewer.file(
@@ -696,6 +944,14 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
                     _pageTurns = turns;
                     _currentPage = _pdfViewerController.pageNumber;
                   });
+                  // An edit replaces the viewer, which takes the running
+                  // search with it. Re-run it so the bar that is still open
+                  // keeps meaning something.
+                  if (_isSearching &&
+                      _searchQuery.isNotEmpty &&
+                      _searchResult == null) {
+                    _runSearch(_searchQuery);
+                  }
                 },
                 onDocumentLoadFailed: (details) {
                   _showMessage('Could not open document: ${details.error}');
@@ -711,12 +967,25 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
               ),
               if (isDrawingTool) _buildDrawingOverlay(),
               if (_isEnteringText && _textPosition != null) _buildTextEntry(),
-              if (_pageSizes.isNotEmpty) _buildPageIndicator(),
+              // Stacked in one bottom-aligned column rather than positioned
+              // separately: the settings bar used to be drawn over the page
+              // indicator whenever a tool was active.
               Positioned(
                 bottom: 0,
                 left: 0,
                 right: 0,
-                child: _buildToolSettingsBar(theme, hasPending),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    if (_pageSizes.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(0, 0, 16, 12),
+                        child: _buildPageIndicator(),
+                      ),
+                    _buildToolSettingsBar(theme),
+                  ],
+                ),
               ),
               // Kept last so the scrim actually covers the tool bar and blocks
               // input while an edit is being written.
@@ -755,21 +1024,21 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Widget _buildTitle() => Text(
-        widget.document.name,
-        style: const TextStyle(fontSize: 16),
-        overflow: TextOverflow.ellipsis,
-      );
+    widget.document.name,
+    style: const TextStyle(fontSize: 16),
+    overflow: TextOverflow.ellipsis,
+  );
 
   Widget _buildSearchField() => TextField(
-        controller: _searchController,
-        autofocus: true,
-        decoration: const InputDecoration(
-          hintText: 'Search...',
-          border: InputBorder.none,
-        ),
-        textInputAction: TextInputAction.search,
-        onSubmitted: _runSearch,
-      );
+    controller: _searchController,
+    autofocus: true,
+    decoration: const InputDecoration(
+      hintText: 'Search...',
+      border: InputBorder.none,
+    ),
+    textInputAction: TextInputAction.search,
+    onSubmitted: _runSearch,
+  );
 
   List<Widget> _buildActions() {
     if (_isSearching) {
@@ -876,24 +1145,32 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Widget _buildDrawingOverlay() {
+    // In pan mode the overlay still paints the pending preview but stops
+    // taking input, so pinch and scroll land on the viewer underneath.
     return Positioned.fill(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onPanStart: (details) =>
-            setState(() => _currentDrawing = [details.localPosition]),
-        onPanUpdate: (details) =>
-            setState(() => _currentDrawing.add(details.localPosition)),
-        onPanEnd: (_) => _onDrawEnd(),
-        child: CustomPaint(
-          size: Size.infinite,
-          painter: _DrawingPainter(
-            points: _currentDrawing,
-            tool: _activeTool,
-            drawColor: _selectedDrawColor,
-            drawWidth: _selectedDrawWidth,
-            highlightColor: _selectedHighlightColor,
-            strokes: _pendingDrawStrokes,
-            highlights: _pendingHighlights,
+      child: IgnorePointer(
+        ignoring: _panMode,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanStart: (details) =>
+              setState(() => _currentDrawing = [details.localPosition]),
+          onPanUpdate: (details) =>
+              setState(() => _currentDrawing.add(details.localPosition)),
+          onPanEnd: (_) => _onDrawEnd(),
+          onPanCancel: () => setState(() => _currentDrawing = []),
+          child: CustomPaint(
+            size: Size.infinite,
+            painter: _DrawingPainter(
+              points: _currentDrawing,
+              tool: _activeTool,
+              drawColor: _selectedDrawColor,
+              drawWidth: _selectedDrawWidth,
+              highlightColor: _selectedHighlightColor,
+              strokes: _pendingDrawStrokes,
+              highlights: _pendingHighlights,
+              controller: _pdfViewerController,
+              repaint: _overlayTick,
+            ),
           ),
         ),
       ),
@@ -901,13 +1178,26 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Widget _buildTextEntry() {
+    // Clamped into the viewport: tapping near the right edge or the bottom of
+    // the page used to put half the box, or its confirm button, off screen.
+    const double boxWidth = 220;
+    const double boxHeight = 64;
+    final double left = (_textPosition!.dx - boxWidth / 2).clamp(
+      8.0,
+      (_viewportWidth - boxWidth - 8).clamp(8.0, double.infinity),
+    );
+    final double top = (_textPosition!.dy - boxHeight).clamp(
+      8.0,
+      (_viewportHeight - boxHeight - 8).clamp(8.0, double.infinity),
+    );
+
     return Positioned(
-      left: _textPosition!.dx,
-      top: _textPosition!.dy - 20,
+      left: left,
+      top: top,
       child: Material(
         color: Colors.transparent,
         child: Container(
-          width: 200,
+          width: boxWidth,
           color: Colors.white.withAlpha(230),
           child: TextField(
             controller: _textOverlayController,
@@ -932,35 +1222,34 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
   }
 
   Widget _buildPageIndicator() {
-    return Positioned(
-      bottom: 16,
-      right: 16,
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: _isLoading ? null : _showThumbnails,
-          borderRadius: BorderRadius.circular(16),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.black.withAlpha(178),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.grid_view_rounded,
-                    color: Colors.white, size: 14),
-                const SizedBox(width: 6),
-                Text(
-                  '$_currentPage/${_pageSizes.length}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: _isLoading ? null : _showThumbnails,
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.black.withAlpha(178),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.grid_view_rounded,
+                color: Colors.white,
+                size: 14,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '$_currentPage/${_pageSizes.length}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -1040,8 +1329,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
             const SizedBox(height: 4),
             Text(
               label,
-              style: theme.textTheme.labelSmall
-                  ?.copyWith(color: foreground, fontWeight: FontWeight.w600),
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: foreground,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ],
         ),
@@ -1049,7 +1340,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     );
   }
 
-  Widget _buildToolSettingsBar(ThemeData theme, bool hasPending) {
+  Widget _buildToolSettingsBar(ThemeData theme) {
     if (_activeTool == EditTool.none) return const SizedBox.shrink();
 
     Widget content;
@@ -1077,46 +1368,71 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
           ],
         );
       case EditTool.draw:
-        content = Row(
+        content = Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Width:'),
-            Expanded(
-              child: Slider(
-                value: _selectedDrawWidth,
-                min: 1.0,
-                max: 20.0,
-                divisions: 19,
-                label: _selectedDrawWidth.round().toString(),
-                onChanged: (val) => setState(() => _selectedDrawWidth = val),
-              ),
+            Row(
+              children: [
+                const Text('Width:'),
+                Expanded(
+                  child: Slider(
+                    value: _selectedDrawWidth,
+                    min: 1.0,
+                    max: 20.0,
+                    divisions: 19,
+                    label: _selectedDrawWidth.round().toString(),
+                    onChanged: (val) =>
+                        setState(() => _selectedDrawWidth = val),
+                  ),
+                ),
+                for (final color in const [
+                  Colors.black,
+                  Colors.blue,
+                  Colors.red,
+                ])
+                  _buildColorPicker(
+                    color,
+                    (c) => setState(() => _selectedDrawColor = c),
+                    _selectedDrawColor,
+                  ),
+              ],
             ),
-            for (final color in const [Colors.black, Colors.blue, Colors.red])
-              _buildColorPicker(
-                color,
-                (c) => setState(() => _selectedDrawColor = c),
-                _selectedDrawColor,
-              ),
-            if (_pendingDrawStrokes.isNotEmpty)
-              _buildApplyButton(_commitPendingDrawStrokes),
+            _buildPendingActions(
+              theme,
+              hasPending: _pendingDrawStrokes.isNotEmpty,
+              onUndo: () => _discardLastPending(_pendingDrawStrokes),
+              onDiscardAll: () => _discardAllPending(_pendingDrawStrokes),
+              onApply: _commitPendingDrawStrokes,
+            ),
           ],
         );
       case EditTool.highlight:
-        content = Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        content = Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            for (final color in const [
-              Colors.yellow,
-              Colors.greenAccent,
-              Colors.lightBlueAccent,
-              Colors.pinkAccent,
-            ])
-              _buildColorPicker(
-                color,
-                (c) => setState(() => _selectedHighlightColor = c),
-                _selectedHighlightColor,
-              ),
-            if (_pendingHighlights.isNotEmpty)
-              _buildApplyButton(_commitPendingHighlights),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                for (final color in const [
+                  Colors.yellow,
+                  Colors.greenAccent,
+                  Colors.lightBlueAccent,
+                  Colors.pinkAccent,
+                ])
+                  _buildColorPicker(
+                    color,
+                    (c) => setState(() => _selectedHighlightColor = c),
+                    _selectedHighlightColor,
+                  ),
+              ],
+            ),
+            _buildPendingActions(
+              theme,
+              hasPending: _pendingHighlights.isNotEmpty,
+              onUndo: () => _discardLastPending(_pendingHighlights),
+              onDiscardAll: () => _discardAllPending(_pendingHighlights),
+              onApply: _commitPendingHighlights,
+            ),
           ],
         );
       case EditTool.none:
@@ -1139,17 +1455,65 @@ class _PdfEditorScreenState extends State<PdfEditorScreen> {
     );
   }
 
-  Widget _buildApplyButton(VoidCallback onPressed) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 8.0),
-      child: FilledButton(
-        onPressed: _isLoading ? null : onPressed,
-        style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          minimumSize: const Size(0, 36),
+  /// Pan toggle plus the three things a user needs to be able to do with work
+  /// that has been drawn but not yet written: take back the last stroke, throw
+  /// the whole batch away, or commit it.
+  ///
+  /// Without Undo and Discard the only exit from a bad stroke was to commit it
+  /// and then undo the resulting document, which costs a full PDF rewrite.
+  Widget _buildPendingActions(
+    ThemeData theme, {
+    required bool hasPending,
+    required VoidCallback onUndo,
+    required VoidCallback onDiscardAll,
+    required VoidCallback onApply,
+  }) {
+    return Row(
+      children: [
+        IconButton(
+          icon: Icon(_panMode ? Icons.pan_tool_rounded : Icons.edit_rounded),
+          isSelected: _panMode,
+          onPressed: _isLoading
+              ? null
+              : () {
+                  setState(() => _panMode = !_panMode);
+                  _syncOverlayTicker();
+                },
+          tooltip: _panMode ? 'Drawing paused — tap to draw' : 'Scroll & zoom',
         ),
-        child: const Text('Apply'),
-      ),
+        Expanded(
+          child: Text(
+            _panMode ? 'Scroll and zoom' : 'Draw on the page',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        if (hasPending) ...[
+          IconButton(
+            icon: const Icon(Icons.undo_rounded),
+            onPressed: _isLoading ? null : onUndo,
+            tooltip: 'Undo last',
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline_rounded),
+            onPressed: _isLoading ? null : onDiscardAll,
+            tooltip: 'Discard all',
+          ),
+          Padding(
+            padding: const EdgeInsets.only(left: 4),
+            child: FilledButton(
+              onPressed: _isLoading ? null : onApply,
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                minimumSize: const Size(0, 36),
+              ),
+              child: const Text('Apply'),
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1195,7 +1559,14 @@ class _DrawingPainter extends CustomPainter {
   final List<_PendingStroke> strokes;
   final List<_PendingHighlight> highlights;
 
-  const _DrawingPainter({
+  /// Reads the viewer's current transform at paint time.
+  ///
+  /// Pending work is held in scene space, so the projection has to be the live
+  /// one rather than whatever it was when this painter was constructed —
+  /// otherwise the preview slides off the page as soon as the user pans.
+  final PdfViewerController controller;
+
+  _DrawingPainter({
     required this.points,
     required this.tool,
     required this.drawColor,
@@ -1203,13 +1574,22 @@ class _DrawingPainter extends CustomPainter {
     required this.highlightColor,
     required this.strokes,
     required this.highlights,
-  });
+    required this.controller,
+    required Listenable repaint,
+  }) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
+    final double zoom = controller.zoomLevel;
+    final Offset scroll = controller.scrollOffset;
+    Offset toScreen(Offset scene) => (scene - scroll) * zoom;
+
     for (final h in highlights) {
       canvas.drawRect(
-        h.screenBounds,
+        Rect.fromPoints(
+          toScreen(h.sceneBounds.topLeft),
+          toScreen(h.sceneBounds.bottomRight),
+        ),
         Paint()
           ..color = h.color.withAlpha(128)
           ..style = PaintingStyle.fill,
@@ -1217,7 +1597,14 @@ class _DrawingPainter extends CustomPainter {
     }
 
     for (final stroke in strokes) {
-      _drawPolyline(canvas, stroke.screenPoints, stroke.color, stroke.width);
+      _drawPolyline(
+        canvas,
+        stroke.scenePoints.map(toScreen).toList(growable: false),
+        stroke.color,
+        // Zoom the preview's thickness too, or a stroke drawn zoomed in
+        // visibly changes weight the moment it is committed.
+        stroke.width * zoom,
+      );
     }
 
     if (points.isEmpty) return;
