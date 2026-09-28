@@ -1,12 +1,21 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import '../services/document_service.dart';
 import '../services/recent_documents.dart';
 import '../services/scan_service.dart';
+import '../widgets/document_actions.dart';
+import '../widgets/document_details_sheet.dart';
+import '../widgets/export_sheet.dart';
+import 'merge_screen.dart';
 import 'pdf_editor_screen.dart';
 import 'scan_screen.dart';
+
+enum _Shelf { recent, favorites }
+
+enum _TileAction { rename, share, print, favorite, details, forget, delete }
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,6 +27,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   List<DocumentRef> _recentFiles = [];
+  List<DocumentRef> _favorites = [];
+  _Shelf _shelf = _Shelf.recent;
 
   StreamSubscription<DocumentRef>? _incoming;
 
@@ -58,8 +69,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _loadRecentFiles() async {
     final refs = await RecentDocuments.load();
+    final favorites = await FavoriteDocuments.load();
     if (!mounted) return;
-    setState(() => _recentFiles = refs);
+    setState(() {
+      _recentFiles = refs;
+      _favorites = favorites;
+    });
   }
 
   Future<void> _addRecentFile(DocumentRef ref) async {
@@ -74,6 +89,12 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _recentFiles = refs);
   }
 
+  /// Drops a document that turned out to be gone from both shelves.
+  Future<void> _forgetMissing(DocumentRef ref) async {
+    await RecentDocuments.forget(ref);
+    await _loadRecentFiles();
+  }
+
   Future<void> _open(DocumentRef ref) async {
     if (!mounted) return;
     _isEditorOpen = true;
@@ -86,24 +107,31 @@ class _HomeScreenState extends State<HomeScreen> {
       _isEditorOpen = false;
     }
     if (!mounted) return;
-    // The document may have been saved while it was open.
+    // The document may have been saved, renamed or starred while it was open.
     await _loadRecentFiles();
+  }
+
+  /// Re-resolves [ref] to a fresh cache copy. Reports and forgets it when it
+  /// is gone.
+  Future<DocumentRef?> _resolve(DocumentRef ref) async {
+    // Re-resolves the URI and refreshes the cache copy. Null means the file
+    // is gone or the persisted grant was revoked.
+    final DocumentRef? resolved = await DocumentService.reopen(ref);
+    if (!mounted) return null;
+    if (resolved == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('File no longer exists')));
+      await _forgetMissing(ref);
+    }
+    return resolved;
   }
 
   Future<void> _openRecentFile(DocumentRef ref) async {
     setState(() => _isLoading = true);
     try {
-      // Re-resolves the URI and refreshes the cache copy. Null means the file
-      // is gone or the persisted grant was revoked.
-      final DocumentRef? resolved = await DocumentService.reopen(ref);
-      if (!mounted) return;
-      if (resolved == null) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('File no longer exists')));
-        await _removeRecentFile(ref);
-        return;
-      }
+      final DocumentRef? resolved = await _resolve(ref);
+      if (resolved == null || !mounted) return;
       await _addRecentFile(resolved);
       await _open(resolved);
     } catch (e) {
@@ -147,9 +175,69 @@ class _HomeScreenState extends State<HomeScreen> {
     await _open(created);
   }
 
+  Future<void> _merge() async {
+    final File? merged = await MergeScreen.open(context);
+    if (merged == null || !mounted) return;
+    final DocumentRef? saved = await ExportSheet.show(
+      context,
+      files: [merged],
+      mimeType: 'application/pdf',
+      title: 'Merged PDF ready',
+    );
+    if (!mounted) return;
+    await _loadRecentFiles();
+    if (saved != null && mounted) await _open(saved);
+  }
+
+  Future<void> _onTileAction(DocumentRef ref, _TileAction action) async {
+    switch (action) {
+      case _TileAction.rename:
+        final DocumentRef? renamed = await DocumentActions.rename(context, ref);
+        if (renamed != null) await _loadRecentFiles();
+      case _TileAction.favorite:
+        await DocumentActions.toggleFavorite(context, ref);
+        await _loadRecentFiles();
+      case _TileAction.forget:
+        await _removeRecentFile(ref);
+      case _TileAction.delete:
+        if (await DocumentActions.delete(context, ref)) await _loadRecentFiles();
+      case _TileAction.share:
+      case _TileAction.print:
+      case _TileAction.details:
+        // These need the bytes, which means a fresh cache copy.
+        setState(() => _isLoading = true);
+        try {
+          final DocumentRef? resolved = await _resolve(ref);
+          if (resolved == null || !mounted) return;
+          setState(() => _isLoading = false);
+          switch (action) {
+            case _TileAction.share:
+              await DocumentActions.share(context, resolved.file, resolved.name);
+            case _TileAction.print:
+              await DocumentActions.printFile(
+                context,
+                resolved.file,
+                resolved.name,
+              );
+            default:
+              await DocumentDetailsSheet.show(
+                context,
+                document: resolved,
+                file: resolved.file,
+              );
+          }
+        } finally {
+          if (mounted) setState(() => _isLoading = false);
+        }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final List<DocumentRef> shelf = _shelf == _Shelf.recent
+        ? _recentFiles
+        : _favorites;
 
     return Scaffold(
       backgroundColor: theme.colorScheme.surface,
@@ -204,29 +292,77 @@ class _HomeScreenState extends State<HomeScreen> {
                       onTap: () => _scan(ScanSource.gallery),
                     ),
                   ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildQuickAction(
+                      theme,
+                      icon: Icons.library_add_rounded,
+                      title: 'Merge',
+                      subtitle: 'PDFs into one',
+                      onTap: _merge,
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 40),
-              Text(
-                'Recent Files',
-                style: theme.textTheme.titleLarge?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
+              Row(
+                children: [
+                  _buildShelfTab(theme, _Shelf.recent, 'Recent Files'),
+                  const SizedBox(width: 20),
+                  _buildShelfTab(theme, _Shelf.favorites, 'Favorites'),
+                ],
               ),
               const SizedBox(height: 16),
-              if (_recentFiles.isEmpty)
+              if (shelf.isEmpty)
                 _buildEmptyState(theme)
               else
                 ListView.separated(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  itemCount: _recentFiles.length,
+                  itemCount: shelf.length,
                   separatorBuilder: (_, _) => const Divider(),
                   itemBuilder: (context, index) =>
-                      _buildRecentTile(theme, _recentFiles[index]),
+                      _buildRecentTile(theme, shelf[index]),
                 ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildShelfTab(ThemeData theme, _Shelf shelf, String label) {
+    final bool selected = _shelf == shelf;
+    return InkWell(
+      onTap: () => setState(() => _shelf = shelf),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              label,
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.bold,
+                color: selected
+                    ? theme.colorScheme.onSurface
+                    : theme.colorScheme.onSurfaceVariant.withValues(
+                        alpha: 0.6,
+                      ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              height: 3,
+              width: selected ? 32 : 0,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -285,6 +421,8 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// Three of these share a row, so the icon sits above the text rather
+  /// than beside it, where the subtitle would be cut to nothing.
   Widget _buildQuickAction(
     ThemeData theme, {
     required IconData icon,
@@ -296,7 +434,7 @@ class _HomeScreenState extends State<HomeScreen> {
       onTap: _isLoading ? null : onTap,
       borderRadius: BorderRadius.circular(16),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 14),
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
         decoration: BoxDecoration(
           color: theme.colorScheme.surfaceContainerHighest.withValues(
             alpha: 0.5,
@@ -306,30 +444,24 @@ class _HomeScreenState extends State<HomeScreen> {
             color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
           ),
         ),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Icon(icon, color: theme.colorScheme.primary),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: theme.textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  Text(
-                    subtitle,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+            const SizedBox(height: 8),
+            Text(
+              title,
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.bold,
               ),
+            ),
+            Text(
+              subtitle,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
@@ -338,6 +470,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildEmptyState(ThemeData theme) {
+    final bool favorites = _shelf == _Shelf.favorites;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(32),
@@ -351,13 +484,13 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Column(
         children: [
           Icon(
-            Icons.folder_open_rounded,
+            favorites ? Icons.star_border_rounded : Icons.folder_open_rounded,
             size: 48,
             color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
           ),
           const SizedBox(height: 16),
           Text(
-            'No recent files yet',
+            favorites ? 'No favorites yet' : 'No recent files yet',
             style: theme.textTheme.bodyLarge?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
               fontWeight: FontWeight.w500,
@@ -365,7 +498,10 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 4),
           Text(
-            'Files you open will appear here',
+            favorites
+                ? 'Star a document from its menu to keep it here'
+                : 'Files you open will appear here',
+            textAlign: TextAlign.center,
             style: theme.textTheme.bodyMedium?.copyWith(
               color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
             ),
@@ -376,17 +512,24 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildRecentTile(ThemeData theme, DocumentRef ref) {
+    final bool favorite = _favorites.any((f) => f.key == ref.key);
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      leading: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.primaryContainer,
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Icon(
-          Icons.picture_as_pdf_rounded,
-          color: theme.colorScheme.primary,
+      leading: Badge(
+        isLabelVisible: favorite,
+        backgroundColor: Colors.transparent,
+        alignment: AlignmentDirectional.topEnd,
+        label: const Icon(Icons.star_rounded, size: 16, color: Colors.amber),
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.primaryContainer,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(
+            Icons.picture_as_pdf_rounded,
+            color: theme.colorScheme.primary,
+          ),
         ),
       ),
       title: Text(
@@ -407,10 +550,60 @@ class _HomeScreenState extends State<HomeScreen> {
         overflow: TextOverflow.ellipsis,
       ),
       onTap: _isLoading ? null : () => _openRecentFile(ref),
-      trailing: IconButton(
-        icon: const Icon(Icons.close_rounded, size: 20),
-        onPressed: () => _removeRecentFile(ref),
-        tooltip: 'Remove from recents',
+      trailing: PopupMenuButton<_TileAction>(
+        icon: const Icon(Icons.more_vert_rounded),
+        tooltip: 'More',
+        enabled: !_isLoading,
+        onSelected: (action) => _onTileAction(ref, action),
+        itemBuilder: (_) => [
+          _menuItem(_TileAction.rename, Icons.drive_file_rename_outline, 'Rename'),
+          _menuItem(_TileAction.share, Icons.ios_share_rounded, 'Share'),
+          if (DocumentService.supportsSaf)
+            _menuItem(_TileAction.print, Icons.print_outlined, 'Print'),
+          _menuItem(
+            _TileAction.favorite,
+            favorite ? Icons.star_rounded : Icons.star_border_rounded,
+            favorite ? 'Remove from Favorites' : 'Add to Favorites',
+          ),
+          _menuItem(_TileAction.details, Icons.info_outline_rounded, 'Details'),
+          if (_shelf == _Shelf.recent)
+            _menuItem(
+              _TileAction.forget,
+              Icons.playlist_remove_rounded,
+              'Remove from recents',
+            ),
+          _menuItem(
+            _TileAction.delete,
+            Icons.delete_outline_rounded,
+            'Delete file',
+            color: theme.colorScheme.error,
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<_TileAction> _menuItem(
+    _TileAction value,
+    IconData icon,
+    String label, {
+    Color? color,
+  }) {
+    return PopupMenuItem(
+      value: value,
+      child: Row(
+        children: [
+          Icon(icon, size: 20, color: color),
+          const SizedBox(width: 12),
+          // Menus are capped in width; a long label ellipsises, not overflows.
+          Flexible(
+            child: Text(
+              label,
+              style: TextStyle(color: color),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -94,10 +94,12 @@ void main() {
 
       // The home screen scrolls, and the recents list sits below the fold on
       // a test-sized viewport, so the tile has to be brought into view first.
-      final removeButton = find.byIcon(Icons.close_rounded).first;
-      await tester.ensureVisible(removeButton);
+      final menuButton = find.byIcon(Icons.more_vert_rounded).first;
+      await tester.ensureVisible(menuButton);
       await tester.pumpAndSettle();
-      await tester.tap(removeButton);
+      await tester.tap(menuButton);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Remove from recents'));
       await tester.pumpAndSettle();
 
       expect(find.text('a.pdf'), findsNothing);
@@ -147,6 +149,59 @@ void main() {
 
       expect(find.text('Saves to the original file'), findsOneWidget);
       expect(find.text('Read-only copy'), findsOneWidget);
+    });
+
+    testWidgets('favorites have their own shelf', (tester) async {
+      SharedPreferences.setMockInitialValues({
+        'recent_files': [refFor('recent.pdf').encode()],
+        'favorite_files': [refFor('starred.pdf').encode()],
+      });
+      await pumpHome(tester);
+
+      expect(find.text('recent.pdf'), findsOneWidget);
+      expect(find.text('starred.pdf'), findsNothing);
+
+      await tester.ensureVisible(find.text('Favorites'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Favorites'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('starred.pdf'), findsOneWidget);
+      expect(find.text('recent.pdf'), findsNothing);
+    });
+
+    testWidgets('an empty favorites shelf says how to fill it', (tester) async {
+      await pumpHome(tester);
+      await tester.ensureVisible(find.text('Favorites'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Favorites'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('No favorites yet'), findsOneWidget);
+    });
+
+    testWidgets('starring from the menu adds to favorites', (tester) async {
+      SharedPreferences.setMockInitialValues({
+        'recent_files': [refFor('a.pdf').encode()],
+      });
+      await pumpHome(tester);
+
+      final menuButton = find.byIcon(Icons.more_vert_rounded).first;
+      await tester.ensureVisible(menuButton);
+      await tester.pumpAndSettle();
+      await tester.tap(menuButton);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Add to Favorites'));
+      await tester.pumpAndSettle();
+
+      final prefs = await SharedPreferences.getInstance();
+      final favorites = (prefs.getStringList('favorite_files') ?? [])
+          .map(DocumentRef.decode)
+          .whereType<DocumentRef>()
+          .toList();
+      expect(favorites.single.name, 'a.pdf');
+      // Still listed under recents too.
+      expect(prefs.getStringList('recent_files'), hasLength(1));
     });
 
     testWidgets('shows the display name rather than an opaque URI', (

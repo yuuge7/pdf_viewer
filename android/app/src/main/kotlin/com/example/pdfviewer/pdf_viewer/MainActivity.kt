@@ -1,22 +1,43 @@
 package com.example.pdfviewer.pdf_viewer
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.print.PageRange
+import android.print.PrintAttributes
+import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
+import android.print.PrintManager
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Storage Access Framework bridge plus native page rasterisation.
@@ -36,14 +57,40 @@ class MainActivity : FlutterActivity() {
         const val CHANNEL = "propdf/documents"
         const val REQUEST_OPEN = 4001
         const val REQUEST_CREATE = 4002
+        const val REQUEST_OPEN_MANY = 4003
+        const val REQUEST_TREE = 4004
         const val PERSISTABLE_FLAGS =
             Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+
+        /** Where exports land in shared storage, under Pictures or Download. */
+        const val EXPORT_FOLDER = "ProPDF Studio"
+
+        /**
+         * Largest bitmap rendered in one piece. ARGB_8888 is four bytes a
+         * pixel, so this is about 64 MB -- enough for a poster-sized page at
+         * print resolution, small enough not to kill a low-end phone.
+         */
+        const val MAX_RENDER_PIXELS = 16_000_000L
+
+        /** JPEG cannot encode either side longer than this. */
+        const val MAX_JPEG_SIDE = 65_000
     }
 
     private var pendingResult: MethodChannel.Result? = null
 
     /** Bytes waiting to be written once ACTION_CREATE_DOCUMENT returns a URI. */
     private var pendingCreateSource: String? = null
+
+    /**
+     * Whether a created document is adopted: a persistable grant taken and a
+     * cache copy made so it can be opened. Exports that are not PDFs the app
+     * will reopen -- a .docx -- skip both rather than hoard grants.
+     */
+    private var pendingCreateKeep = true
+
+    /** Files waiting to be written once ACTION_OPEN_DOCUMENT_TREE returns. */
+    private var pendingExportPaths: List<String>? = null
+    private var pendingExportMime: String? = null
 
     /**
      * A document the app was launched with, held until Dart asks for it.
@@ -101,11 +148,70 @@ class MainActivity : FlutterActivity() {
     private fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "pickDocument" -> pickDocument(result)
+            "pickDocuments" -> pickDocuments(result)
             "createDocument" -> createDocument(
                 call.argument<String>("name") ?: "document.pdf",
                 call.argument<String>("sourcePath"),
+                call.argument<String>("mime") ?: "application/pdf",
+                call.argument<Boolean>("keep") ?: true,
                 result
             )
+            "exportFiles" -> exportFiles(
+                call.argument<List<String>>("paths") ?: emptyList(),
+                call.argument<String>("mime") ?: "application/octet-stream",
+                call.argument<String>("target") ?: "folder",
+                result
+            )
+            "documentInfo" -> onWorker(result) { documentInfo(Uri.parse(call.argument<String>("uri")!!)) }
+            "renameDocument" -> onWorker(result) {
+                renameDocument(call.argument<String>("uri")!!, call.argument<String>("name")!!)
+            }
+            "deleteDocument" -> onWorker(result) { deleteDocument(call.argument<String>("uri")!!) }
+            "printDocument" -> {
+                try {
+                    printDocument(call.argument<String>("path")!!, call.argument<String>("name") ?: "Document")
+                    result.success(null)
+                } catch (e: Exception) {
+                    result.error("failed", e.message, null)
+                }
+            }
+            "renderPages" -> onWorker(result) {
+                renderPages(
+                    call.argument<String>("path")!!,
+                    call.argument<List<Int>>("pages") ?: emptyList(),
+                    call.argument<String>("outDir")!!,
+                    call.argument<String>("baseName") ?: "page",
+                    call.argument<Int>("width") ?: 1600,
+                    call.argument<Double>("dpi"),
+                    call.argument<String>("format") ?: "jpeg",
+                    call.argument<Int>("quality") ?: 90
+                )
+            }
+            "renderLongImage" -> onWorker(result) {
+                renderLongImage(
+                    call.argument<String>("path")!!,
+                    call.argument<String>("outPath")!!,
+                    call.argument<Int>("width") ?: 1080,
+                    call.argument<Int>("quality") ?: 88
+                )
+            }
+            "keepScreenOn" -> {
+                if (call.argument<Boolean>("on") == true) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                }
+                result.success(null)
+            }
+            "sdkInt" -> result.success(Build.VERSION.SDK_INT)
+            "openUrl" -> launch(Intent(Intent.ACTION_VIEW, Uri.parse(call.argument<String>("url")!!)), result)
+            "viewUri" -> {
+                val view = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(Uri.parse(call.argument<String>("uri")!!), call.argument<String>("mime"))
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                launch(Intent.createChooser(view, null), result)
+            }
             "copyToCache" -> onWorker(result) { copyToCache(call.argument<String>("uri")!!) }
             "writeDocument" -> onWorker(result) {
                 writeDocument(call.argument<String>("uri")!!, call.argument<String>("sourcePath")!!)
@@ -130,10 +236,20 @@ class MainActivity : FlutterActivity() {
                 renderPage(
                     call.argument<String>("path")!!,
                     call.argument<Int>("page")!!,
-                    call.argument<Int>("width") ?: 160
+                    call.argument<Int>("width") ?: 160,
+                    call.argument<Int>("quality")
                 )
             }
             else -> result.notImplemented()
+        }
+    }
+
+    private fun launch(intent: Intent, result: MethodChannel.Result) {
+        try {
+            startActivity(intent)
+            result.success(null)
+        } catch (e: ActivityNotFoundException) {
+            result.error("no_app", "No app on this device can open that.", null)
         }
     }
 
@@ -174,43 +290,167 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun createDocument(name: String, sourcePath: String?, result: MethodChannel.Result) {
+    /** Several PDFs to read once, e.g. to merge. No lasting grant is taken. */
+    private fun pickDocuments(result: MethodChannel.Result) {
+        if (pendingResult != null) {
+            result.error("busy", "Another document chooser is already open.", null)
+            return
+        }
+        pendingResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/pdf"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivityForResult(intent, REQUEST_OPEN_MANY)
+        } catch (e: Exception) {
+            pendingResult = null
+            result.error("no_picker", "No document picker available.", null)
+        }
+    }
+
+    private fun createDocument(
+        name: String,
+        sourcePath: String?,
+        mime: String,
+        keep: Boolean,
+        result: MethodChannel.Result
+    ) {
         if (pendingResult != null) {
             result.error("busy", "Another document chooser is already open.", null)
             return
         }
         pendingResult = result
         pendingCreateSource = sourcePath
+        pendingCreateKeep = keep
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/pdf"
+            type = mime
             putExtra(Intent.EXTRA_TITLE, name)
-            addFlags(PERSISTABLE_FLAGS or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            addFlags(
+                if (keep) PERSISTABLE_FLAGS or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                else PERSISTABLE_FLAGS
+            )
         }
         try {
             startActivityForResult(intent, REQUEST_CREATE)
         } catch (e: Exception) {
             pendingResult = null
             pendingCreateSource = null
+            pendingCreateKeep = true
             result.error("no_picker", "No document picker available.", null)
         }
     }
 
+    /**
+     * Delivers finished files. Gallery and Downloads go through MediaStore,
+     * which needs no permission from Android 10 on; anything else, or an
+     * older device, goes to a folder the user picks.
+     */
+    private fun exportFiles(paths: List<String>, mime: String, target: String, result: MethodChannel.Result) {
+        if (target == "gallery" || target == "downloads") {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                result.error("unsupported", "Saving there needs Android 10 or later.", null)
+                return
+            }
+            onWorker(result) { exportToMediaStore(paths, mime, gallery = target == "gallery") }
+            return
+        }
+        if (pendingResult != null) {
+            result.error("busy", "Another document chooser is already open.", null)
+            return
+        }
+        pendingResult = result
+        pendingExportPaths = paths
+        pendingExportMime = mime
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(PERSISTABLE_FLAGS)
+        }
+        try {
+            startActivityForResult(intent, REQUEST_TREE)
+        } catch (e: Exception) {
+            pendingResult = null
+            pendingExportPaths = null
+            pendingExportMime = null
+            result.error("no_picker", "No folder picker available.", null)
+        }
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode != REQUEST_OPEN && requestCode != REQUEST_CREATE) {
+        if (requestCode != REQUEST_OPEN &&
+            requestCode != REQUEST_CREATE &&
+            requestCode != REQUEST_OPEN_MANY &&
+            requestCode != REQUEST_TREE
+        ) {
             super.onActivityResult(requestCode, resultCode, data)
             return
         }
         val result = pendingResult
         val createSource = pendingCreateSource
+        val keep = pendingCreateKeep
+        val exportPaths = pendingExportPaths
+        val exportMime = pendingExportMime
         pendingResult = null
         pendingCreateSource = null
+        pendingCreateKeep = true
+        pendingExportPaths = null
+        pendingExportMime = null
         if (result == null) return
 
-        val uri = data?.data
-        if (resultCode != Activity.RESULT_OK || uri == null) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
             // Cancelling is a normal outcome, not an error.
             result.success(null)
+            return
+        }
+
+        if (requestCode == REQUEST_OPEN_MANY) {
+            val uris = mutableListOf<Uri>()
+            data.clipData?.let { clip ->
+                for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { uris.add(it) }
+            }
+            if (uris.isEmpty()) data.data?.let { uris.add(it) }
+            worker.execute {
+                try {
+                    // Copied now, while the picker's temporary grant holds.
+                    val picked = uris.map {
+                        mapOf("path" to copyToCache(it.toString()), "name" to displayName(it))
+                    }
+                    main.post { result.success(picked) }
+                } catch (e: Exception) {
+                    main.post { result.error("failed", e.message, null) }
+                }
+            }
+            return
+        }
+
+        if (requestCode == REQUEST_TREE) {
+            val tree = data.data
+            if (tree == null || exportPaths == null) {
+                result.success(null)
+                return
+            }
+            onWorker(result) { exportToTree(tree, exportPaths, exportMime ?: "application/octet-stream") }
+            return
+        }
+
+        val uri = data.data
+        if (uri == null) {
+            result.success(null)
+            return
+        }
+
+        if (requestCode == REQUEST_CREATE && !keep) {
+            worker.execute {
+                try {
+                    if (createSource != null) writeDocument(uri.toString(), createSource)
+                    val payload = mapOf("uri" to uri.toString(), "name" to displayName(uri))
+                    main.post { result.success(payload) }
+                } catch (e: Exception) {
+                    main.post { result.error("failed", e.message, null) }
+                }
+            }
             return
         }
 
@@ -218,7 +458,7 @@ class MainActivity : FlutterActivity() {
         // Only the modes actually granted may be taken -- asking for WRITE on a
         // read-only provider throws, and swallowing that would leave no grant
         // at all, so the document would vanish from Recent Files next launch.
-        val granted = (data?.flags ?: 0) and PERSISTABLE_FLAGS
+        val granted = data.flags and PERSISTABLE_FLAGS
         val toTake = if (granted != 0) granted else Intent.FLAG_GRANT_READ_URI_PERMISSION
         try {
             contentResolver.takePersistableUriPermission(uri, toTake)
@@ -286,7 +526,9 @@ class MainActivity : FlutterActivity() {
     private fun copyToCache(uriString: String): String {
         val uri = Uri.parse(uriString)
         sweepStaleCacheCopies()
-        val target = File(cacheDir, "open_${System.currentTimeMillis()}.pdf")
+        // A unique name: several documents picked at once are copied within
+        // the same millisecond.
+        val target = File.createTempFile("open_", ".pdf", cacheDir)
         contentResolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Could not open $uriString" }
             target.outputStream().use { input.copyTo(it) }
@@ -375,6 +617,229 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    // --- Managing the document itself ---------------------------------------
+
+    /** Size, date, a readable location and what the provider allows. */
+    private fun documentInfo(uri: Uri): Map<String, Any?> {
+        var size: Long? = null
+        var modified: Long? = null
+        var flags = 0
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+                    val dateIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                    if (dateIndex >= 0 && !cursor.isNull(dateIndex)) modified = cursor.getLong(dateIndex)
+                    val flagIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                    if (flagIndex >= 0 && !cursor.isNull(flagIndex)) flags = cursor.getInt(flagIndex)
+                }
+            }
+        } catch (_: Exception) {
+            // Some providers answer only the openable columns; the rest stay unknown.
+        }
+        val isDocument = DocumentsContract.isDocumentUri(this, uri)
+        return mapOf(
+            "size" to size,
+            "modified" to modified,
+            "location" to readableLocation(uri),
+            "canRename" to (isDocument && flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME != 0),
+            "canDelete" to (isDocument && flags and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0)
+        )
+    }
+
+    /**
+     * A location a person can read. Local storage encodes the real path in
+     * the document ID; anything else is described by the app that holds it.
+     */
+    private fun readableLocation(uri: Uri): String? {
+        val authority = uri.authority ?: return uri.path
+        if (DocumentsContract.isDocumentUri(this, uri)) {
+            val id = DocumentsContract.getDocumentId(uri)
+            when (authority) {
+                "com.android.externalstorage.documents" -> {
+                    val volume = id.substringBefore(':')
+                    val relative = id.substringAfter(':', "")
+                    val root = if (volume.equals("primary", ignoreCase = true)) {
+                        "/storage/emulated/0"
+                    } else {
+                        "/storage/$volume"
+                    }
+                    return if (relative.isEmpty()) root else "$root/$relative"
+                }
+                "com.android.providers.downloads.documents" ->
+                    if (id.startsWith("raw:")) return id.removePrefix("raw:")
+            }
+        }
+        return try {
+            packageManager.resolveContentProvider(authority, 0)
+                ?.loadLabel(packageManager)?.toString() ?: authority
+        } catch (_: Exception) {
+            authority
+        }
+    }
+
+    private fun renameDocument(uriString: String, name: String): Map<String, Any?> {
+        val uri = Uri.parse(uriString)
+        if (!DocumentsContract.isDocumentUri(this, uri)) {
+            throw IllegalStateException("This file cannot be renamed from here.")
+        }
+        val renamed = DocumentsContract.renameDocument(contentResolver, uri, name)
+            ?: throw IllegalStateException("The app holding this file refused to rename it.")
+        if (renamed != uri) {
+            // Providers that encode the name in the ID hand back a new URI and
+            // move the caller's grant onto it. Make it last, if allowed.
+            try {
+                contentResolver.takePersistableUriPermission(renamed, PERSISTABLE_FLAGS)
+            } catch (_: SecurityException) {
+                try {
+                    contentResolver.takePersistableUriPermission(renamed, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (_: SecurityException) {
+                    // Good for this session only.
+                }
+            }
+            releasePermission(uriString)
+        }
+        val writable = canWrite(renamed.toString()) ||
+            checkCallingOrSelfUriPermission(renamed, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) ==
+            PackageManager.PERMISSION_GRANTED
+        return mapOf(
+            "uri" to renamed.toString(),
+            "name" to displayName(renamed),
+            "canWrite" to writable
+        )
+    }
+
+    private fun deleteDocument(uriString: String): Boolean {
+        val uri = Uri.parse(uriString)
+        val deleted = if (DocumentsContract.isDocumentUri(this, uri)) {
+            DocumentsContract.deleteDocument(contentResolver, uri)
+        } else {
+            contentResolver.delete(uri, null, null) > 0
+        }
+        if (deleted) releasePermission(uriString)
+        return deleted
+    }
+
+    /** Hands the file to the system print dialog, which does the rest. */
+    private fun printDocument(path: String, name: String) {
+        val file = File(path)
+        require(file.exists()) { "Nothing to print at $path" }
+        val manager = getSystemService(Context.PRINT_SERVICE) as PrintManager
+        manager.print(name, object : PrintDocumentAdapter() {
+            override fun onLayout(
+                oldAttributes: PrintAttributes?,
+                newAttributes: PrintAttributes?,
+                cancellationSignal: CancellationSignal?,
+                callback: LayoutResultCallback,
+                extras: Bundle?
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onLayoutCancelled()
+                    return
+                }
+                val info = PrintDocumentInfo.Builder(name)
+                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                    .build()
+                callback.onLayoutFinished(info, true)
+            }
+
+            override fun onWrite(
+                pages: Array<out PageRange>?,
+                destination: ParcelFileDescriptor,
+                cancellationSignal: CancellationSignal?,
+                callback: WriteResultCallback
+            ) {
+                try {
+                    // Every page is written; the spooler picks out the range
+                    // the user asked for.
+                    FileInputStream(file).use { input ->
+                        FileOutputStream(destination.fileDescriptor).use { input.copyTo(it) }
+                    }
+                    if (cancellationSignal?.isCanceled == true) {
+                        callback.onWriteCancelled()
+                    } else {
+                        callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                    }
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.message)
+                }
+            }
+        }, null)
+    }
+
+    // --- Exporting -----------------------------------------------------------
+
+    private fun exportToTree(tree: Uri, paths: List<String>, mime: String): Int {
+        val parent = DocumentsContract.buildDocumentUriUsingTree(
+            tree,
+            DocumentsContract.getTreeDocumentId(tree)
+        )
+        var written = 0
+        for (path in paths) {
+            val source = File(path)
+            val target = DocumentsContract.createDocument(
+                contentResolver,
+                parent,
+                mimeFor(source.name, mime),
+                source.name
+            ) ?: continue
+            contentResolver.openOutputStream(target, "w")?.use { output ->
+                source.inputStream().use { it.copyTo(output) }
+                written++
+            }
+        }
+        return written
+    }
+
+    private fun exportToMediaStore(paths: List<String>, mime: String, gallery: Boolean): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw IllegalStateException("Saving there needs Android 10 or later.")
+        }
+        val collection = if (gallery) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        }
+        val folder = (if (gallery) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_DOWNLOADS) +
+            "/" + EXPORT_FOLDER
+        var written = 0
+        for (path in paths) {
+            val source = File(path)
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, source.name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeFor(source.name, mime))
+                put(MediaStore.MediaColumns.RELATIVE_PATH, folder)
+                // Hidden from other apps until the bytes are all there.
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val item = contentResolver.insert(collection, values) ?: continue
+            try {
+                contentResolver.openOutputStream(item)!!.use { output ->
+                    source.inputStream().use { it.copyTo(output) }
+                }
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                contentResolver.update(item, values, null, null)
+                written++
+            } catch (e: Exception) {
+                contentResolver.delete(item, null, null)
+                throw e
+            }
+        }
+        return written
+    }
+
+    /** The file's own type where its extension says, [fallback] otherwise. */
+    private fun mimeFor(name: String, fallback: String): String =
+        when (name.substringAfterLast('.', "").lowercase()) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "pdf" -> "application/pdf"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else -> fallback
+        }
+
     private fun displayName(uri: Uri): String {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
             ?.use { cursor ->
@@ -390,23 +855,132 @@ class MainActivity : FlutterActivity() {
 
     private fun pageCount(path: String): Int = withRenderer(path) { it.pageCount }
 
-    /** Rasterises one page to a PNG at [width] logical pixels wide. */
-    private fun renderPage(path: String, page: Int, width: Int): ByteArray? =
+    /**
+     * Rasterises one page at [width] pixels wide: PNG, or JPEG at [quality]
+     * when one is given.
+     */
+    private fun renderPage(path: String, page: Int, width: Int, quality: Int?): ByteArray? =
         withRenderer(path) { renderer ->
             if (page < 0 || page >= renderer.pageCount) return@withRenderer null
             renderer.openPage(page).use { pdfPage ->
-                val height = (width.toFloat() * pdfPage.height / pdfPage.width).toInt().coerceAtLeast(1)
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                // PdfRenderer composites onto whatever is already there, so an
-                // unpainted bitmap renders black where the page is blank.
-                bitmap.eraseColor(Color.WHITE)
-                pdfPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                val bitmap = renderToBitmap(pdfPage, width)
                 val out = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                if (quality != null) {
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+                } else {
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                }
                 bitmap.recycle()
                 out.toByteArray()
             }
         }
+
+    /**
+     * Renders [pages] to numbered files in [outDir], each [width] pixels wide
+     * or, with [dpi], at that resolution of its physical size.
+     */
+    private fun renderPages(
+        path: String,
+        pages: List<Int>,
+        outDir: String,
+        baseName: String,
+        width: Int,
+        dpi: Double?,
+        format: String,
+        quality: Int
+    ): List<String> = withRenderer(path) { renderer ->
+        val directory = File(outDir).apply { mkdirs() }
+        val jpeg = format != "png"
+        val extension = if (jpeg) "jpg" else "png"
+        val digits = renderer.pageCount.toString().length
+        pages.filter { it in 0 until renderer.pageCount }.map { index ->
+            renderer.openPage(index).use { pdfPage ->
+                // PdfRenderer reports page size in points (1/72 inch).
+                val pixels = if (dpi != null) (pdfPage.width * dpi / 72.0).roundToInt() else width
+                val bitmap = renderToBitmap(pdfPage, pixels)
+                val number = (index + 1).toString().padStart(digits, '0')
+                val out = File(directory, "${baseName}_$number.$extension")
+                FileOutputStream(out).use {
+                    bitmap.compress(
+                        if (jpeg) Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG,
+                        quality,
+                        it
+                    )
+                }
+                bitmap.recycle()
+                out.absolutePath
+            }
+        }
+    }
+
+    /**
+     * Stitches every page into one tall JPEG, with a thin gap between pages.
+     *
+     * The strip is held in RGB_565 (two bytes a pixel) and its width shrunk
+     * until it fits the memory budget and JPEG's size limit, so a long
+     * document still produces an image rather than an out-of-memory crash.
+     */
+    private fun renderLongImage(path: String, outPath: String, width: Int, quality: Int): String =
+        withRenderer(path) { renderer ->
+            val count = renderer.pageCount
+            require(count > 0) { "The document has no pages." }
+            val gap = 12
+            val ratios = DoubleArray(count) { i ->
+                renderer.openPage(i).use { it.height.toDouble() / it.width }
+            }
+            fun heightAt(w: Int): Int = ratios.sumOf { (w * it).roundToInt().coerceAtLeast(1) } + gap * (count - 1)
+
+            // 3000 wide keeps an A4 page under MAX_RENDER_PIXELS, so every
+            // page renders at exactly the strip width.
+            var w = width.coerceIn(200, 3000)
+            val budget = 40_000_000L
+            while (w > 200 && (w.toLong() * heightAt(w) > budget || heightAt(w) > MAX_JPEG_SIDE)) {
+                w = (w * 0.85).toInt().coerceAtLeast(200)
+            }
+            val height = heightAt(w)
+            require(height <= MAX_JPEG_SIDE) { "This document is too long for a single image." }
+
+            val sheet = Bitmap.createBitmap(w, height, Bitmap.Config.RGB_565)
+            try {
+                val canvas = Canvas(sheet)
+                canvas.drawColor(Color.rgb(224, 224, 224))
+                var top = 0
+                for (i in 0 until count) {
+                    renderer.openPage(i).use { pdfPage ->
+                        val bitmap = renderToBitmap(pdfPage, w)
+                        canvas.drawBitmap(bitmap, 0f, top.toFloat(), null)
+                        top += bitmap.height + gap
+                        bitmap.recycle()
+                    }
+                }
+                val out = File(outPath).apply { parentFile?.mkdirs() }
+                FileOutputStream(out).use { sheet.compress(Bitmap.CompressFormat.JPEG, quality, it) }
+                out.absolutePath
+            } finally {
+                sheet.recycle()
+            }
+        }
+
+    /**
+     * Renders [pdfPage] onto a white bitmap [width] pixels wide, shrunk if
+     * the page would otherwise exceed [MAX_RENDER_PIXELS].
+     */
+    private fun renderToBitmap(pdfPage: PdfRenderer.Page, width: Int): Bitmap {
+        var w = width.coerceIn(16, 8000)
+        var h = (w.toDouble() * pdfPage.height / pdfPage.width).roundToInt().coerceAtLeast(1)
+        val pixels = w.toLong() * h
+        if (pixels > MAX_RENDER_PIXELS) {
+            val shrink = sqrt(MAX_RENDER_PIXELS.toDouble() / pixels)
+            w = (w * shrink).toInt().coerceAtLeast(1)
+            h = (h * shrink).toInt().coerceAtLeast(1)
+        }
+        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        // PdfRenderer composites onto whatever is already there, so an
+        // unpainted bitmap renders black where the page is blank.
+        bitmap.eraseColor(Color.WHITE)
+        pdfPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        return bitmap
+    }
 
     private fun <T> withRenderer(path: String, block: (PdfRenderer) -> T): T {
         val descriptor = ParcelFileDescriptor.open(

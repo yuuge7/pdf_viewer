@@ -59,6 +59,39 @@ Rect unrotatePageRect(Rect displayRect, Size unrotatedSize, PdfPageTurn turn) {
   );
 }
 
+/// The inverse of [unrotatePagePoint]: where a point in the page's own
+/// unrotated space shows up once the viewer has turned the page for display.
+///
+/// Text extraction reports bounds in unrotated space, so anything drawn over
+/// the viewer from those bounds has to be turned the other way first.
+Offset rotatePagePoint(
+  Offset pagePoint,
+  Size unrotatedSize,
+  PdfPageTurn turn,
+) {
+  final double w = unrotatedSize.width;
+  final double h = unrotatedSize.height;
+  switch (turn) {
+    case PdfPageTurn.none:
+      return pagePoint;
+    case PdfPageTurn.quarter:
+      return Offset(h - pagePoint.dy, pagePoint.dx);
+    case PdfPageTurn.half:
+      return Offset(w - pagePoint.dx, h - pagePoint.dy);
+    case PdfPageTurn.threeQuarter:
+      return Offset(pagePoint.dy, w - pagePoint.dx);
+  }
+}
+
+/// Converts a rectangle in unrotated page space into displayed page space,
+/// normalised so left <= right and top <= bottom.
+Rect rotatePageRect(Rect pageRect, Size unrotatedSize, PdfPageTurn turn) {
+  if (turn == PdfPageTurn.none) return pageRect;
+  final Offset a = rotatePagePoint(pageRect.topLeft, unrotatedSize, turn);
+  final Offset b = rotatePagePoint(pageRect.bottomRight, unrotatedSize, turn);
+  return Rect.fromPoints(a, b);
+}
+
 /// A point resolved onto a specific PDF page.
 @immutable
 class PdfPagePoint {
@@ -153,6 +186,21 @@ class PdfPageGeometry {
 
   /// Converts a screen-space point in the viewer to scene space.
   Offset toScene(Offset screenPoint) => screenPoint / zoom + scrollOffset;
+
+  /// Converts a scene-space point back to the screen.
+  Offset toScreen(Offset scenePoint) => (scenePoint - scrollOffset) * zoom;
+
+  /// Where a rectangle in page [index]'s displayed space sits in scene space.
+  Rect pageRectToScene(int index, Rect displayRect) {
+    final double scale = fitScaleFor(index);
+    final double top = sceneTopFor(index);
+    return Rect.fromLTRB(
+      displayRect.left * scale,
+      top + displayRect.top * scale,
+      displayRect.right * scale,
+      top + displayRect.bottom * scale,
+    );
+  }
 
   /// Resolves a screen-space point onto a page.
   ///
