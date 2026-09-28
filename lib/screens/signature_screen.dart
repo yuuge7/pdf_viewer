@@ -163,10 +163,90 @@ class _SignaturePadScreenState extends State<SignaturePadScreen> {
   bool _saving = false;
 
   static const List<Color> _inks = [
-    Color(0xFF111111),
-    Color(0xFF1E40AF),
-    Color(0xFFB91C1C),
+    Color(0xFF111111), // black
+    Color(0xFF4B5563), // grey
+    Color(0xFF1E40AF), // dark blue
+    Color(0xFF2563EB), // blue
+    Color(0xFF0E7490), // teal
+    Color(0xFF15803D), // green
+    Color(0xFF6D28D9), // purple
+    Color(0xFFBE185D), // pink
+    Color(0xFFB91C1C), // red
+    Color(0xFFC2410C), // orange
+    Color(0xFF78350F), // brown
+    Color(0xFF1E3A8A), // navy
+    Color(0xFF0369A1), // sky
+    Color(0xFF065F46), // forest
+    Color(0xFF4D7C0F), // olive
+    Color(0xFF7E22CE), // violet
+    Color(0xFF9D174D), // wine
+    Color(0xFFB45309), // amber
+    Color(0xFFA16207), // gold
   ];
+
+  /// A colour picked with the custom picker; shown after the palette.
+  Color? _custom;
+
+  Future<void> _pickCustom() async {
+    HSVColor hsv = HSVColor.fromColor(_custom ?? _color);
+    final Color? picked = await showDialog<Color>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialog) {
+          Widget slider(String label, double value, double max,
+              HSVColor Function(double) apply) {
+            return Row(
+              children: [
+                SizedBox(width: 84, child: Text(label)),
+                Expanded(
+                  child: Slider(
+                    value: value,
+                    max: max,
+                    onChanged: (v) => setDialog(() => hsv = apply(v)),
+                  ),
+                ),
+              ],
+            );
+          }
+
+          return AlertDialog(
+            title: const Text('Custom colour'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: hsv.toColor(),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                slider('Hue', hsv.hue, 360, hsv.withHue),
+                slider('Saturation', hsv.saturation, 1, hsv.withSaturation),
+                slider('Brightness', hsv.value, 1, hsv.withValue),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(hsv.toColor()),
+                child: const Text('Use'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      _custom = picked;
+      _color = picked;
+    });
+  }
 
   Future<void> _save() async {
     if (_strokes.isEmpty) return;
@@ -277,29 +357,43 @@ class _SignaturePadScreenState extends State<SignaturePadScreen> {
                 ),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            // Scrolls sideways, so the palette can grow past the screen width.
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
               child: Row(
                 children: [
-                  for (final Color ink in _inks)
+                  for (final Color ink in [..._inks, ?_custom])
                     GestureDetector(
                       onTap: () => setState(() => _color = ink),
                       child: Container(
                         margin: const EdgeInsets.only(right: 10),
-                        width: 32,
-                        height: 32,
+                        width: 36,
+                        height: 36,
                         decoration: BoxDecoration(
                           color: ink,
                           shape: BoxShape.circle,
                           border: Border.all(
                             color: _color == ink
                                 ? theme.colorScheme.primary
-                                : Colors.transparent,
-                            width: 3,
+                                : theme.colorScheme.outlineVariant,
+                            width: _color == ink ? 3 : 1,
                           ),
                         ),
                       ),
                     ),
+                  IconButton.outlined(
+                    tooltip: 'Custom colour',
+                    icon: const Icon(Icons.colorize_rounded),
+                    onPressed: _pickCustom,
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Row(
+                children: [
                   Expanded(
                     child: Slider(
                       value: _width,
