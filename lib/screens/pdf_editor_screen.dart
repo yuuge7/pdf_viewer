@@ -6,6 +6,8 @@ import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:syncfusion_flutter_core/theme.dart'
+    show SfPdfViewerTheme, SfPdfViewerThemeData;
 import 'package:syncfusion_flutter_pdf/pdf.dart'
     show PdfPage, PdfPageRotateAngle;
 // The viewer exports its own PdfTextLine (search results); ours is the
@@ -884,11 +886,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
   Future<void> _showHelp() {
     final ThemeData theme = Theme.of(context);
-    Widget item(IconData icon, String title, String body) => ListTile(
-      leading: Icon(icon),
-      title: Text(title),
-      subtitle: Text(body),
-    );
+    Widget item(IconData icon, String title, String body) =>
+        ListTile(leading: Icon(icon), title: Text(title), subtitle: Text(body));
     return showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -1068,10 +1067,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     if (picked == null || !mounted) return;
     final Uint8List? bytes = await _runBusy(
       'Preparing image',
-      () async => PdfService.normalizePhoto(
-        await picked!.readAsBytes(),
-        maxEdge: 2000,
-      ),
+      () async =>
+          PdfService.normalizePhoto(await picked!.readAsBytes(), maxEdge: 2000),
     );
     if (bytes != null && mounted) await _startPlacement(bytes);
   }
@@ -1337,7 +1334,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       context,
       files: images,
       mimeType: options.png ? 'image/png' : 'image/jpeg',
-      title: images.length == 1 ? 'Image ready' : '${images.length} images ready',
+      title: images.length == 1
+          ? 'Image ready'
+          : '${images.length} images ready',
     );
   }
 
@@ -1442,7 +1441,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     if (saved != null && mounted) {
       _showMessage(
         'Saved ${saved.name}',
-        action: SnackBarAction(label: 'Open', onPressed: () => _openOther(saved)),
+        action: SnackBarAction(
+          label: 'Open',
+          onPressed: () => _openOther(saved),
+        ),
       );
     }
   }
@@ -1886,7 +1888,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         _activeTool == EditTool.draw || _isMarkup(_activeTool);
     // Tints would also tint the live annotation colours, which draw on top
     // of the page unfiltered, so editing shows the page as it is.
-    final PageTheme pageTheme = _editMode ? PageTheme.original : _settings.theme;
+    final PageTheme pageTheme = _editMode
+        ? PageTheme.original
+        : _settings.theme;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1898,35 +1902,40 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           children: [
             ColorFiltered(
               colorFilter: pageTheme.filter,
-              child: SfPdfViewer.file(
-                _currentFile,
-                key: _pdfViewerKey,
-                controller: _pdfViewerController,
-                initialScrollOffset: _targetScrollOffset ?? Offset.zero,
-                initialZoomLevel: _targetZoom ?? 1.0,
-                canShowScrollHead: false,
-                canShowScrollStatus: false,
-                pageSpacing: kPageSpacing,
-                scrollDirection:
-                    _editMode ||
-                        _settings.direction == ReadingDirection.vertical
-                    ? PdfScrollDirection.vertical
-                    : PdfScrollDirection.horizontal,
-                pageLayoutMode: !_editMode && _settings.pageByPage
-                    ? PdfPageLayoutMode.single
-                    : PdfPageLayoutMode.continuous,
-                onDocumentLoaded: _onDocumentLoaded,
-                onDocumentLoadFailed: (details) {
-                  _showMessage('Could not open document: ${details.error}');
-                },
-                onPageChanged: (details) {
-                  // Nothing observes the controller, so without this the page
-                  // indicator stayed frozen on the page the document opened at.
-                  if (mounted) {
-                    setState(() => _currentPage = details.newPageNumber);
-                  }
-                },
-                onTap: _isTextTool ? _onViewerTap : null,
+              child: SfPdfViewerTheme(
+                data: SfPdfViewerThemeData(
+                  backgroundColor: pageTheme.viewerBackground,
+                ),
+                child: SfPdfViewer.file(
+                  _currentFile,
+                  key: _pdfViewerKey,
+                  controller: _pdfViewerController,
+                  initialScrollOffset: _targetScrollOffset ?? Offset.zero,
+                  initialZoomLevel: _targetZoom ?? 1.0,
+                  canShowScrollHead: false,
+                  canShowScrollStatus: false,
+                  pageSpacing: kPageSpacing,
+                  scrollDirection:
+                      _editMode ||
+                          _settings.direction == ReadingDirection.vertical
+                      ? PdfScrollDirection.vertical
+                      : PdfScrollDirection.horizontal,
+                  pageLayoutMode: !_editMode && _settings.pageByPage
+                      ? PdfPageLayoutMode.single
+                      : PdfPageLayoutMode.continuous,
+                  onDocumentLoaded: _onDocumentLoaded,
+                  onDocumentLoadFailed: (details) {
+                    _showMessage('Could not open document: ${details.error}');
+                  },
+                  onPageChanged: (details) {
+                    // Nothing observes the controller, so without this the page
+                    // indicator stayed frozen on the page the document opened at.
+                    if (mounted) {
+                      setState(() => _currentPage = details.newPageNumber);
+                    }
+                  },
+                  onTap: _isTextTool ? _onViewerTap : null,
+                ),
               ),
             ),
             if (isDrawingTool) _buildDrawingOverlay(),
@@ -2806,8 +2815,11 @@ class _WordIcon extends StatelessWidget {
         border: Border.all(color: color, width: 2),
         borderRadius: BorderRadius.circular(4),
       ),
+      // The button's tooltip names the action; the letter is decoration and
+      // would otherwise be read out as "W".
       child: Text(
         'W',
+        semanticsLabel: '',
         style: TextStyle(
           color: color,
           fontSize: 12,
@@ -2855,9 +2867,8 @@ class _LineEditorSheetState extends State<_LineEditorSheet> {
     super.dispose();
   }
 
-  void _submit(String text) => Navigator.of(
-    context,
-  ).pop(_LineEdit(text, _size, _bold, _italic, _color));
+  void _submit(String text) =>
+      Navigator.of(context).pop(_LineEdit(text, _size, _bold, _italic, _color));
 
   @override
   Widget build(BuildContext context) {
@@ -2887,9 +2898,7 @@ class _LineEditorSheetState extends State<_LineEditorSheet> {
                 controller: _text,
                 autofocus: true,
                 maxLines: null,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(border: OutlineInputBorder()),
               ),
               const SizedBox(height: 8),
               Row(

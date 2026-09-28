@@ -38,6 +38,9 @@ dependencies:
   path_provider: ^2.1.6
   syncfusion_flutter_pdfviewer: ^34.2.4
   syncfusion_flutter_pdf: ^34.2.4
+  # Viewer theming (background behind the pages). Already resolved through
+  # the viewer; listed because it is imported directly.
+  syncfusion_flutter_core: ^34.2.4
   share_plus: ^13.3.0
   shared_preferences: ^2.5.5
   image_picker: ^1.2.0

@@ -19,6 +19,14 @@ enum PageTheme {
 
   const PageTheme(this.label, this.paperColor, this.inkColor);
 
+  /// Background for the viewer behind the pages, or null for its default.
+  ///
+  /// The filter applies to the whole viewer, gaps included. Night inverts,
+  /// so the default dark gap would come out light grey around dark pages;
+  /// a light gap inverts to dark.
+  Color? get viewerBackground =>
+      this == PageTheme.night ? const Color(0xFFE8E8E8) : null;
+
   /// The filter that turns a rendered page into this theme.
   ///
   /// Paper and eye comfort multiply the page by a tint, so white takes the
