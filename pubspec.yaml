@@ -102,8 +102,23 @@ flutter:
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
 
+# app_icon.jpg is the original artwork: the icon as a tile on a mock-up
+# background. The generated icons use art cut from it:
+#  - app_icon_full.png: the tile's gradient carried to the edges, logo inside
+#    the adaptive-icon safe zone. Android 8+ masks it to the launcher's shape;
+#    without an adaptive icon the launcher shrinks the old square icon into a
+#    white circle instead.
+#  - app_icon_legacy.png: the tile with its own rounded corners, for launchers
+#    older than Android 8 that show the icon as-is.
 flutter_launcher_icons:
   android: "launcher_icon"
   ios: true
-  image_path: "assets/icon/app_icon.jpg"
+  image_path: "assets/icon/app_icon_full.png"
+  image_path_android: "assets/icon/app_icon_legacy.png"
+  adaptive_icon_foreground: "assets/icon/app_icon_full.png"
+  # The art is already full-bleed; the default 16% inset would ring it with
+  # the background colour.
+  adaptive_icon_foreground_inset: 0
+  adaptive_icon_background: "#0E1A5E"
+  remove_alpha_ios: true
   min_sdk_android: 21
