@@ -141,4 +141,25 @@ void main() {
     expect(find.text('Compress PDF'), findsOneWidget);
     expect(find.text('Delete'), findsOneWidget);
   });
+
+  testWidgets('an unsaved import offers nothing that needs a real file', (
+    tester,
+  ) async {
+    // What a Word or text file becomes when it is opened from another app:
+    // a PDF in temporary storage with no document behind it.
+    final DocumentRef unsaved = DocumentRef.unsaved(
+      path: ref.path,
+      name: 'doc.pdf',
+    );
+    await tester.pumpWidget(
+      MaterialApp(home: PdfEditorScreen(document: unsaved)),
+    );
+    await settleReal(tester);
+
+    await tester.tap(find.byTooltip('More'));
+    await settleReal(tester, rounds: 5);
+    expect(find.text('Compress PDF'), findsOneWidget);
+    expect(find.text('Rename'), findsNothing);
+    expect(find.text('Delete'), findsNothing);
+  });
 }

@@ -31,17 +31,72 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <!-- Makes the app an option under "Open with" for a PDF coming
+            <!-- Makes the app an option under "Open with" for a file coming
                  from a file manager, a mail client or a browser download.
                  MainActivity turns the intent's URI into a DocumentRef; the
                  grant that comes with a VIEW intent is temporary and usually
-                 read-only, so such a document opens as a read-only copy. -->
+                 read-only, so a PDF opens as a read-only copy.
+
+                 Only types the app can do something with are listed, and
+                 everything that is not a PDF is converted to one on the way
+                 in (lib/services/document_import.dart): Word and plain text
+                 are laid out as pages, a picture starts a scan session. The
+                 image types are the ones the Dart decoder reads; HEIC is not
+                 among them, so it is not claimed.
+
+                 Every <data> in a filter combines with every other, so this
+                 is both schemes against each type. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <category android:name="android.intent.category.BROWSABLE"/>
-                <data android:scheme="content" android:mimeType="application/pdf"/>
-                <data android:scheme="file" android:mimeType="application/pdf"/>
+                <data android:scheme="content"/>
+                <data android:scheme="file"/>
+                <data android:mimeType="application/pdf"/>
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/>
+                <data android:mimeType="text/plain"/>
+                <data android:mimeType="image/jpeg"/>
+                <data android:mimeType="image/png"/>
+                <data android:mimeType="image/webp"/>
+                <data android:mimeType="image/gif"/>
+                <data android:mimeType="image/bmp"/>
+                <data android:mimeType="image/x-ms-bmp"/>
+            </intent-filter>
+            <!-- The same documents from senders that do not know their type.
+                 Messengers and some download managers hand a .pdf or .docx
+                 over as a generic binary (or, for .docx, as the zip it is),
+                 and the filter above never sees it. Matching on the name is
+                 the only handle left, and it only works where the URI ends
+                 in the file name; an opaque content URI stays unmatched.
+
+                 A path is only tested when a host is given, hence the
+                 wildcard host. pathSuffix is exact but needs Android 12; on
+                 older versions pathPattern's ".*" stops at the first dot it
+                 meets, so each extra dot in a path needs a pattern of its
+                 own. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="content"/>
+                <data android:scheme="file"/>
+                <data android:host="*"/>
+                <data android:mimeType="application/octet-stream"/>
+                <data android:mimeType="application/zip"/>
+                <data android:pathSuffix=".pdf"/>
+                <data android:pathSuffix=".PDF"/>
+                <data android:pathSuffix=".docx"/>
+                <data android:pathSuffix=".DOCX"/>
+                <data android:pathPattern=".*\\.pdf"/>
+                <data android:pathPattern=".*\\..*\\.pdf"/>
+                <data android:pathPattern=".*\\..*\\..*\\.pdf"/>
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.pdf"/>
+                <data android:pathPattern=".*\\.PDF"/>
+                <data android:pathPattern=".*\\.docx"/>
+                <data android:pathPattern=".*\\..*\\.docx"/>
+                <data android:pathPattern=".*\\..*\\..*\\.docx"/>
+                <data android:pathPattern=".*\\..*\\..*\\..*\\.docx"/>
+                <data android:pathPattern=".*\\.DOCX"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

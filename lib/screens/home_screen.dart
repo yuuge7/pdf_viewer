@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../services/document_import.dart';
 import '../services/document_service.dart';
 import '../services/recent_documents.dart';
 import '../services/scan_service.dart';
@@ -30,11 +31,15 @@ class _HomeScreenState extends State<HomeScreen> {
   List<DocumentRef> _favorites = [];
   _Shelf _shelf = _Shelf.recent;
 
-  StreamSubscription<DocumentRef>? _incoming;
+  StreamSubscription<IncomingDocument>? _incoming;
 
   /// True while the editor is already on screen, so a second "Open with"
   /// intent does not stack another editor on top of it.
   bool _isEditorOpen = false;
+
+  /// True while a file that is not a PDF is being converted or reviewed on
+  /// its way in, for the same reason.
+  bool _isImporting = false;
 
   @override
   void initState() {
@@ -53,18 +58,123 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Opens the document the app was launched with, if another app handed it
   /// one through "Open with".
   Future<void> _consumeLaunchDocument() async {
-    final DocumentRef? launched = await DocumentService.startListening();
+    final IncomingDocument? launched = await DocumentService.startListening();
     if (launched == null || !mounted) return;
     await _openIncoming(launched);
   }
 
-  Future<void> _openIncoming(DocumentRef ref) async {
-    if (!mounted || _isEditorOpen) return;
+  Future<void> _openIncoming(IncomingDocument incoming) async {
+    if (!mounted || _isEditorOpen || _isImporting) return;
+    final DocumentRef ref = incoming.ref;
+    ImportKind kind;
+    try {
+      kind = await DocumentImport.kindOf(
+        ref.file,
+        name: ref.name,
+        mimeType: incoming.mimeType,
+      );
+    } catch (_) {
+      // Unreadable; let the viewer be the one to say so.
+      kind = ImportKind.pdf;
+    }
+    if (!mounted) return;
+    if (kind != ImportKind.pdf) {
+      await _import(ref, kind);
+      return;
+    }
     // Only documents the app holds a lasting grant on are worth remembering:
     // the temporary grant on a shared document is gone by the next launch, and
     // the entry would only ever resolve to "File no longer exists".
     if (ref.canWrite) await _addRecentFile(ref);
     await _open(ref);
+  }
+
+  /// Brings in a file that is not a PDF: a Word or text file is converted
+  /// and opened as an unsaved document, a picture starts a scan session.
+  Future<void> _import(DocumentRef source, ImportKind kind) async {
+    // The file is read once, here. Nothing will reopen it, so a lasting
+    // grant on it, where the sending app offered one, goes straight back.
+    unawaited(DocumentService.release(source));
+    if (kind == ImportKind.unsupported) {
+      _showMessage('ProPDF Studio cannot open "${source.name}".');
+      return;
+    }
+
+    _isImporting = true;
+    try {
+      if (kind == ImportKind.image) {
+        final File photo = await _withProgress(
+          'Preparing ${source.name}',
+          () => DocumentImport.preparePhoto(source.file),
+        );
+        if (!mounted) return;
+        await _scan(ScanSource.gallery, initialImages: [photo.path]);
+        return;
+      }
+
+      final DocumentRef converted = await _withProgress(
+        'Converting ${source.name} to PDF',
+        () => DocumentImport.toPdf(source, kind),
+      );
+      if (!mounted) return;
+      _showMessage(
+        kind == ImportKind.word
+            ? 'Converted from Word with a simplified layout. '
+                  'Use Save a copy to keep the PDF.'
+            : 'Converted to PDF. Use Save a copy to keep it.',
+      );
+      await _open(converted);
+    } on ImportException catch (e) {
+      _showMessage('Could not open "${source.name}". ${e.message}');
+    } catch (e) {
+      _showMessage('Could not open "${source.name}": $e');
+    } finally {
+      _isImporting = false;
+    }
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Runs [task] behind a dialog that says what is taking the time.
+  ///
+  /// A conversion is seconds of work with nothing on screen but a home page
+  /// the user did not ask for, so it needs saying.
+  Future<T> _withProgress<T>(String label, Future<T> Function() task) async {
+    final NavigatorState navigator = Navigator.of(context, rootNavigator: true);
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => PopScope(
+          canPop: false,
+          child: AlertDialog(
+            content: Row(
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(width: 24),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    try {
+      return await task();
+    } finally {
+      navigator.pop();
+    }
   }
 
   Future<void> _loadRecentFiles() async {
@@ -164,10 +274,14 @@ class _HomeScreenState extends State<HomeScreen> {
   /// The session saves through the system picker itself and records the
   /// result in Recent Files, so there is nothing to add here — only the list
   /// on screen needs refreshing.
-  Future<void> _scan(ScanSource source) async {
+  Future<void> _scan(
+    ScanSource source, {
+    List<String> initialImages = const [],
+  }) async {
     final DocumentRef? created = await ScanScreen.createDocument(
       context,
       source: source,
+      initialImages: initialImages,
     );
     if (!mounted) return;
     await _loadRecentFiles();

@@ -160,9 +160,10 @@ class DocumentActions {
     DocumentRef ref,
   ) async {
     // Same rule as Recent Files: a document handed over by another app comes
-    // with a grant that is gone by the next launch, so a star on it could
-    // only ever lead to "File no longer exists".
-    if (ref.uri != null && !ref.canWrite) {
+    // with a grant that is gone by the next launch, and one converted on the
+    // way in is a temporary file, so a star on either could only ever lead
+    // to "File no longer exists".
+    if (!ref.savesInPlace) {
       showMessage(
         context,
         'Save a copy first to add this document to Favorites.',

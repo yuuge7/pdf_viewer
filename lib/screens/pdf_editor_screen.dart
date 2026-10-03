@@ -667,6 +667,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   bool get _hasUnsavedChanges => _currentFile.path != _savedPath;
 
   Future<void> _savePdf() async {
+    // A document converted on the way in exists nowhere yet, edited or not:
+    // saving it means choosing where it goes.
+    if (_doc.isUnsaved) {
+      await _saveCopy();
+      return;
+    }
     if (!_hasUnsavedChanges) {
       _showMessage('No changes to save.');
       return;
@@ -713,6 +719,18 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       // The native side took a persistable grant on the new document. Record
       // it, or that grant leaks and the copy never appears in Recent Files.
       await RecentDocuments.add(saved);
+      if (!mounted) return;
+      if (_doc.isUnsaved) {
+        // The copy is the first real home this document has had, so it
+        // becomes the document: later saves go to it, and there is nothing
+        // left unsaved to warn about on the way out.
+        setState(() {
+          _doc = saved;
+          _savedPath = _currentFile.path;
+        });
+        _showMessage('Saved as ${saved.name}');
+        return;
+      }
       _showMessage('Saved a copy as ${saved.name}');
     } catch (e) {
       if (!mounted) return;
@@ -724,6 +742,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
   String _suggestedCopyName() {
     final String name = _doc.name;
+    // Nothing exists under this name yet for a copy to be told apart from.
+    if (_doc.isUnsaved) return name;
     final int dot = name.lastIndexOf('.');
     if (dot <= 0) return '$name (edited).pdf';
     return '${name.substring(0, dot)} (edited)${name.substring(dot)}';
@@ -748,6 +768,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           _hasPendingAnnotations
               ? 'Annotations you have drawn but not applied, and any edits '
                     'you have not saved, will be lost.'
+              : _doc.isUnsaved
+              ? '${_doc.name} has not been saved anywhere yet.'
               : 'Your edits have not been saved to ${_doc.name}.',
         ),
         actions: [
@@ -759,7 +781,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
             onPressed: () => Navigator.of(dialogContext).pop('discard'),
             child: const Text('Discard'),
           ),
-          if (_doc.savesInPlace)
+          if (_doc.savesInPlace || _doc.isUnsaved)
             FilledButton(
               onPressed: () => Navigator.of(dialogContext).pop('save'),
               child: const Text('Save'),
@@ -1505,6 +1527,13 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           FileAction.toLongImage,
         },
         if (_reflow) FileAction.bookmarks,
+        // There is no file behind an unsaved document to rename, delete or
+        // find again later.
+        if (_doc.isUnsaved) ...{
+          FileAction.rename,
+          FileAction.delete,
+          FileAction.favorite,
+        },
       },
     );
     if (action == null || !mounted) return;

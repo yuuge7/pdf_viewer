@@ -105,6 +105,28 @@ void main() {
     test('a plain file path saves in place', () {
       const ref = DocumentRef(path: '/docs/a.pdf', name: 'a.pdf');
       expect(ref.savesInPlace, isTrue);
+      expect(ref.isUnsaved, isFalse);
+    });
+
+    test('a document converted on the way in has nowhere to save to', () {
+      const ref = DocumentRef.unsaved(
+        path: '/cache/exports/1/report.pdf',
+        name: 'report.pdf',
+      );
+      expect(ref.isUnsaved, isTrue);
+      expect(ref.savesInPlace, isFalse);
+      expect(DocumentRef.decode(ref.encode())!.isUnsaved, isTrue);
+    });
+
+    test('a read-only document is not an unsaved one', () {
+      // It has a file behind it; it just cannot be written to.
+      const ref = DocumentRef(
+        uri: 'content://x/1',
+        path: '/cache/a.pdf',
+        name: 'a.pdf',
+        canWrite: false,
+      );
+      expect(ref.isUnsaved, isFalse);
     });
   });
 

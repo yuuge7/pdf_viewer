@@ -90,6 +90,8 @@ class _DocumentDetailsSheetState extends State<DocumentDetailsSheet> {
         'Access',
         widget.document.savesInPlace
             ? 'Read and write'
+            : widget.document.isUnsaved
+            ? 'Not saved yet (use Save a copy to keep it)'
             : 'Read-only (edits save as a copy)',
       ),
       ('Title', pdf?.title),

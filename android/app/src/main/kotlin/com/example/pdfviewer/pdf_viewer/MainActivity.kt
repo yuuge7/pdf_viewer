@@ -100,6 +100,9 @@ class MainActivity : FlutterActivity() {
      */
     private var launchUri: Uri? = null
 
+    /** The type the launch intent declared for [launchUri], if it gave one. */
+    private var launchType: String? = null
+
     private var channel: MethodChannel? = null
 
     private val worker = Executors.newSingleThreadExecutor()
@@ -110,10 +113,11 @@ class MainActivity : FlutterActivity() {
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .apply { setMethodCallHandler { call, result -> onMethodCall(call, result) } }
         launchUri = viewUriOf(intent)
+        launchType = intent?.type
     }
 
     /**
-     * A second PDF opened while the app is already running.
+     * A second document opened while the app is already running.
      *
      * The activity is singleTop, so this replaces onCreate rather than
      * starting a new instance; Dart is alive by now, so the document is
@@ -123,9 +127,10 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val uri = viewUriOf(intent) ?: return
+        val type = intent.type
         worker.execute {
             try {
-                val payload = describe(uri)
+                val payload = describe(uri, type)
                 main.post { channel?.invokeMethod("documentOpened", payload) }
             } catch (e: Exception) {
                 // Nothing to open; the app simply stays where it was.
@@ -219,11 +224,13 @@ class MainActivity : FlutterActivity() {
             "canWrite" -> result.success(canWrite(call.argument<String>("uri")!!))
             "consumeLaunchDocument" -> {
                 val uri = launchUri
+                val type = launchType
                 launchUri = null
+                launchType = null
                 if (uri == null) {
                     result.success(null)
                 } else {
-                    onWorker(result) { describe(uri) }
+                    onWorker(result) { describe(uri, type) }
                 }
             }
             "displayName" -> onWorker(result) { displayName(Uri.parse(call.argument<String>("uri")!!)) }
@@ -494,8 +501,13 @@ class MainActivity : FlutterActivity() {
      * attempted and allowed to fail: the document still opens for this
      * session, it just reports itself as not writable, which is what makes the
      * editor steer the user to Save a copy instead of writing nowhere.
+     *
+     * The app is offered for more than PDFs, so [type] -- what the sending
+     * app called the file -- travels with it. Dart decides what the file
+     * really is from its contents; this is only a hint for the cases the
+     * contents cannot settle.
      */
-    private fun describe(uri: Uri): Map<String, Any?> {
+    private fun describe(uri: Uri, type: String?): Map<String, Any?> {
         try {
             contentResolver.takePersistableUriPermission(uri, PERSISTABLE_FLAGS)
         } catch (_: SecurityException) {
@@ -508,12 +520,29 @@ class MainActivity : FlutterActivity() {
                 // Temporary grant only; good for this session.
             }
         }
+        val name = displayName(uri)
+        val mime = type ?: try {
+            contentResolver.getType(uri)
+        } catch (_: Exception) {
+            null
+        }
         return mapOf(
             "uri" to uri.toString(),
-            "name" to displayName(uri),
-            "path" to copyToCache(uri.toString()),
-            "canWrite" to canWrite(uri.toString())
+            "name" to name,
+            "path" to copyToCache(uri.toString(), cacheExtension(name)),
+            "canWrite" to canWrite(uri.toString()),
+            "mime" to mime
         )
+    }
+
+    /**
+     * The extension for a cache copy: the file's own where it has a plain
+     * one, so that a Word file or a photo is not left lying about labelled
+     * as a PDF, and `pdf` for a name that carries none.
+     */
+    private fun cacheExtension(name: String): String {
+        val extension = name.substringAfterLast('.', "").lowercase()
+        return if (Regex("[a-z0-9]{1,5}").matches(extension)) extension else "pdf"
     }
 
     // --- Reading and writing -------------------------------------------------
@@ -523,12 +552,12 @@ class MainActivity : FlutterActivity() {
      * File. This is a working copy only; the content URI stays the source of
      * truth for saving.
      */
-    private fun copyToCache(uriString: String): String {
+    private fun copyToCache(uriString: String, extension: String = "pdf"): String {
         val uri = Uri.parse(uriString)
         sweepStaleCacheCopies()
         // A unique name: several documents picked at once are copied within
         // the same millisecond.
-        val target = File.createTempFile("open_", ".pdf", cacheDir)
+        val target = File.createTempFile("open_", ".$extension", cacheDir)
         contentResolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Could not open $uriString" }
             target.outputStream().use { input.copyTo(it) }
@@ -587,16 +616,17 @@ class MainActivity : FlutterActivity() {
     /**
      * Drops working copies from previous sessions.
      *
-     * Every open writes a fresh `open_*.pdf`; without this they accumulate for
-     * the life of the install. Only files older than a day are touched, so the
-     * document currently open is never pulled out from under the viewer.
+     * Every open writes a fresh `open_*` copy; without this they accumulate
+     * for the life of the install. Only files older than a day are touched, so
+     * the document currently open is never pulled out from under the viewer.
+     * The prefix alone identifies them: a copy of something handed over by
+     * another app keeps that file's extension, not `.pdf`.
      */
     private fun sweepStaleCacheCopies() {
         val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
         cacheDir.listFiles()?.forEach { file ->
             val stale = file.isFile &&
                 (file.name.startsWith("open_") || file.name.startsWith("rollback_")) &&
-                file.name.endsWith(".pdf") &&
                 file.lastModified() < cutoff
             if (stale) file.delete()
         }

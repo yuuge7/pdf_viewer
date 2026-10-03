@@ -47,6 +47,9 @@ dependencies:
   image: ^4.5.4
   # Zip container for PDF-to-Word (.docx). Already resolved through `image`.
   archive: ^4.1.0
+  # Reads the parts of a .docx opened from another app. Already resolved
+  # through `image` as well.
+  xml: ^7.0.1
 
 dev_dependencies:
   flutter_test:
@@ -70,6 +73,12 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Roboto (Apache 2.0, licence alongside), embedded in the PDFs built from
+  # Word and text files. PDF's own fonts stop at Western European letters.
+  # Loaded as bytes, so these are assets rather than a `fonts:` family.
+  assets:
+    - assets/fonts/
 
   # To add assets to your application, add an assets section, like this:
   # assets:

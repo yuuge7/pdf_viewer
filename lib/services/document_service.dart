@@ -14,6 +14,9 @@ import 'package:flutter/services.dart';
 /// is what makes edits actually reach the user's document.
 ///
 /// On other platforms [uri] is null and [path] is the real file.
+///
+/// A document converted from something else on the way in is neither: see
+/// [DocumentRef.unsaved].
 @immutable
 class DocumentRef {
   final String? uri;
@@ -28,11 +31,24 @@ class DocumentRef {
     this.canWrite = true,
   });
 
+  /// A PDF the app built itself — out of a Word or a text file — that has
+  /// not been saved anywhere yet.
+  ///
+  /// [path] is a temporary file and there is no document behind it to write
+  /// back to, so the only way to keep it is Save a copy, which is what turns
+  /// it into an ordinary document.
+  const DocumentRef.unsaved({required this.path, required this.name})
+    : uri = null,
+      canWrite = false;
+
   File get file => File(path);
+
+  /// See [DocumentRef.unsaved].
+  bool get isUnsaved => uri == null && !canWrite;
 
   /// True when saving writes to the document the user actually chose, rather
   /// than to a private copy the app will eventually discard.
-  bool get savesInPlace => uri != null ? canWrite : true;
+  bool get savesInPlace => canWrite;
 
   Map<String, dynamic> toJson() => {
     'uri': uri,
@@ -102,6 +118,22 @@ class PickedDocument {
   const PickedDocument({required this.path, required this.name});
 }
 
+/// A file another app asked this one to open, before anyone has looked at
+/// what it is.
+///
+/// The app is offered under "Open with" for more than PDFs, so [ref] may
+/// point at a Word file, a picture or plain text; `DocumentImport` decides
+/// which and what to do about it.
+@immutable
+class IncomingDocument {
+  final DocumentRef ref;
+
+  /// What the sending app said the file is. A hint, and often a wrong one.
+  final String? mimeType;
+
+  const IncomingDocument(this.ref, {this.mimeType});
+}
+
 /// What the platform knows about a document beyond its bytes.
 @immutable
 class DocumentFacts {
@@ -145,10 +177,10 @@ class DocumentService {
   /// The launch intent is consumed once at startup; later ones arrive here as
   /// the platform pushes them, because the activity is singleTop and does not
   /// restart for a second document.
-  static final StreamController<DocumentRef> _incoming =
-      StreamController<DocumentRef>.broadcast();
+  static final StreamController<IncomingDocument> _incoming =
+      StreamController<IncomingDocument>.broadcast();
 
-  static Stream<DocumentRef> get incoming => _incoming.stream;
+  static Stream<IncomingDocument> get incoming => _incoming.stream;
 
   static bool _listening = false;
 
@@ -156,21 +188,21 @@ class DocumentService {
   /// app was launched with, if any.
   ///
   /// Safe to call more than once; only the first call installs the handler.
-  static Future<DocumentRef?> startListening() async {
+  static Future<IncomingDocument?> startListening() async {
     if (!supportsSaf) return null;
     if (!_listening) {
       _listening = true;
       _channel.setMethodCallHandler((call) async {
         if (call.method != 'documentOpened') return null;
-        final DocumentRef? ref = _refFrom(call.arguments);
-        if (ref != null) _incoming.add(ref);
+        final IncomingDocument? document = _incomingFrom(call.arguments);
+        if (document != null) _incoming.add(document);
         return null;
       });
     }
     try {
       final Map<String, dynamic>? launch = await _channel
           .invokeMapMethod<String, dynamic>('consumeLaunchDocument');
-      return _refFrom(launch);
+      return _incomingFrom(launch);
     } on PlatformException {
       return null;
     } on MissingPluginException {
@@ -178,15 +210,18 @@ class DocumentService {
     }
   }
 
-  static DocumentRef? _refFrom(Object? payload) {
+  static IncomingDocument? _incomingFrom(Object? payload) {
     if (payload is! Map) return null;
     final Object? path = payload['path'];
     if (path is! String) return null;
-    return DocumentRef(
-      uri: payload['uri'] as String?,
-      path: path,
-      name: payload['name'] as String? ?? 'document.pdf',
-      canWrite: payload['canWrite'] as bool? ?? false,
+    return IncomingDocument(
+      DocumentRef(
+        uri: payload['uri'] as String?,
+        path: path,
+        name: payload['name'] as String? ?? 'document.pdf',
+        canWrite: payload['canWrite'] as bool? ?? false,
+      ),
+      mimeType: payload['mime'] as String?,
     );
   }
 
@@ -449,12 +484,15 @@ class DocumentService {
       final File file = ref.file;
       if (!file.existsSync()) return const DocumentFacts();
       final FileStat stat = await file.stat();
+      // An unsaved document lives in a temporary folder, which is neither a
+      // place worth showing nor a file worth renaming.
+      final bool real = !ref.isUnsaved;
       return DocumentFacts(
         size: stat.size,
         modified: stat.modified,
-        location: file.path,
-        canRename: true,
-        canDelete: true,
+        location: real ? file.path : null,
+        canRename: real,
+        canDelete: real,
       );
     }
     try {

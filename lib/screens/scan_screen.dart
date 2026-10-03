@@ -29,10 +29,15 @@ class ScanScreen extends StatefulWidget {
   final ScanSource initialSource;
   final ScanDestination destination;
 
+  /// Pictures the session starts with instead of asking [initialSource] for
+  /// some: the ones another app handed over through "Open with".
+  final List<String> initialImages;
+
   const ScanScreen({
     super.key,
     required this.initialSource,
     required this.destination,
+    this.initialImages = const [],
   });
 
   /// Runs a session and returns the saved document, or null if the user
@@ -40,12 +45,14 @@ class ScanScreen extends StatefulWidget {
   static Future<DocumentRef?> createDocument(
     BuildContext context, {
     required ScanSource source,
+    List<String> initialImages = const [],
   }) async {
     final Object? result = await Navigator.of(context).push<Object?>(
       MaterialPageRoute(
         builder: (_) => ScanScreen(
           initialSource: source,
           destination: ScanDestination.newDocument,
+          initialImages: initialImages,
         ),
       ),
     );
@@ -101,7 +108,11 @@ class _ScanScreenState extends State<ScanScreen> {
     // Straight into the camera or the gallery: the session has no content of
     // its own yet, so an empty screen would just be a detour.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _addPages(widget.initialSource, popIfStillEmpty: true);
+      if (widget.initialImages.isNotEmpty) {
+        _adopt(widget.initialImages, popIfStillEmpty: true);
+      } else {
+        _addPages(widget.initialSource, popIfStillEmpty: true);
+      }
     });
   }
 
@@ -160,18 +171,30 @@ class _ScanScreenState extends State<ScanScreen> {
       return;
     }
 
+    await _adopt([for (final XFile file in picked) file.path]);
+  }
+
+  /// Takes the pictures at [paths] into the session as new pages.
+  Future<void> _adopt(
+    List<String> paths, {
+    bool popIfStillEmpty = false,
+  }) async {
     final List<ScanPage> added = [];
-    for (final XFile file in picked) {
+    for (final String path in paths) {
       try {
         // image_picker leaves the shot in a shared cache Android may clear
         // while this screen is still open; keep our own copy.
-        final File retained = await ScanService.retainCapture(file.path);
+        final File retained = await ScanService.retainCapture(path);
         added.add(ScanPage(sourcePath: retained.path));
       } catch (e) {
-        debugPrint('Could not keep capture ${file.path}: $e');
+        debugPrint('Could not keep capture $path: $e');
       }
     }
-    if (!mounted || added.isEmpty) return;
+    if (!mounted) return;
+    if (added.isEmpty) {
+      if (popIfStillEmpty && _pages.isEmpty) Navigator.of(context).pop();
+      return;
+    }
 
     setState(() {
       _pages.addAll(added);
