@@ -45,7 +45,7 @@ class FlowRenderer {
 
 /// One font file: its metrics, the characters it can draw, and a
 /// [PdfFont] for every size asked of it.
-class _Face {
+class FlowFace {
   final Uint8List bytes;
   final List<PdfFontStyle> styles;
 
@@ -64,11 +64,27 @@ class _Face {
     measureTrailingSpaces: true,
   );
 
-  _Face(this.bytes, this.styles) {
+  FlowFace(this.bytes, this.styles) {
     _read();
   }
 
   bool has(int codeUnit) => _covered[codeUnit] == 1;
+
+  /// [text] on one line, with every character the font cannot draw
+  /// replaced. See `_drawable` for why none may reach Syncfusion.
+  String drawable(String text) {
+    final StringBuffer out = StringBuffer();
+    for (final int rune in text.runes) {
+      if (rune == 0x09 || rune == 0x0A || rune == 0x0D) {
+        out.writeCharCode(0x20);
+      } else if (rune <= 0xFFFF && has(rune)) {
+        out.writeCharCode(rune);
+      } else {
+        out.writeCharCode(has(0xFFFD) ? 0xFFFD : 0x3F);
+      }
+    }
+    return out.toString();
+  }
 
   static int _key(double size) => (size * 2).round();
 
@@ -155,7 +171,7 @@ class _Face {
 
 /// How a stretch of text is drawn.
 class _Style {
-  final _Face face;
+  final FlowFace face;
   final double size;
   final int color;
   final bool underline;
@@ -399,7 +415,7 @@ class _Renderer {
   late final PdfSection _section;
 
   /// Indexed by `(bold ? 1 : 0) + (italic ? 2 : 0)`.
-  final List<_Face> _faces;
+  final List<FlowFace> _faces;
 
   late final double _left;
   late final double _top;
@@ -422,10 +438,10 @@ class _Renderer {
 
   _Renderer(this.source, FlowFonts fonts)
     : _faces = [
-        _Face(fonts.regular, const [PdfFontStyle.regular]),
-        _Face(fonts.bold, const [PdfFontStyle.bold]),
-        _Face(fonts.italic, const [PdfFontStyle.italic]),
-        _Face(fonts.boldItalic, const [PdfFontStyle.bold, PdfFontStyle.italic]),
+        FlowFace(fonts.regular, const [PdfFontStyle.regular]),
+        FlowFace(fonts.bold, const [PdfFontStyle.bold]),
+        FlowFace(fonts.italic, const [PdfFontStyle.italic]),
+        FlowFace(fonts.boldItalic, const [PdfFontStyle.bold, PdfFontStyle.italic]),
       ];
 
   Future<Uint8List> run(String title) async {
@@ -597,7 +613,7 @@ class _Renderer {
   /// glyph for it and then records that glyph as meaning the missing
   /// character, after which every real space in the document is extracted,
   /// searched and copied as that character.
-  static String _drawable(int rune, _Face face) {
+  static String _drawable(int rune, FlowFace face) {
     if (rune == 0x2011) return '-';
     if (rune <= 0xFFFF && face.has(rune)) return String.fromCharCode(rune);
     return face.has(0xFFFD) ? '\uFFFD' : '?';

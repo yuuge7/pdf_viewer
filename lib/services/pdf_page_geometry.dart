@@ -151,12 +151,17 @@ class PdfPageGeometry {
   /// Current scroll offset of the viewer, in scene units.
   final Offset scrollOffset;
 
+  /// Height of the viewer widget, in logical pixels. Zero when it is not
+  /// known, which reads as "tall documents only".
+  final double viewportHeight;
+
   const PdfPageGeometry({
     required this.pageSizes,
     required this.viewportWidth,
     required this.pageSpacing,
     required this.zoom,
     required this.scrollOffset,
+    this.viewportHeight = 0,
   });
 
   int get pageCount => pageSizes.length;
@@ -184,11 +189,33 @@ class PdfPageGeometry {
     return top;
   }
 
+  /// Height of every page and the gaps between them, in scene units.
+  double get sceneHeight =>
+      pageCount == 0 ? 0 : sceneTopFor(pageCount - 1) + sceneHeightFor(pageCount - 1);
+
+  /// How far down the first page starts, in scene units.
+  ///
+  /// A document shorter than the viewer does not sit at its top: the viewer
+  /// centres it, and every point picked on screen is that much lower than
+  /// the scroll offset alone says. A single page on a tall phone is the
+  /// everyday case.
+  double get topInset => insetFor(sceneHeight, viewportHeight, zoom);
+
+  /// [topInset] for a document [sceneHeight] tall, for callers that have
+  /// the pieces and no geometry.
+  static double insetFor(double sceneHeight, double viewportHeight, double zoom) {
+    if (viewportHeight <= 0 || zoom <= 0) return 0;
+    final double spare = viewportHeight / zoom - sceneHeight;
+    return spare > 0 ? spare / 2 : 0;
+  }
+
   /// Converts a screen-space point in the viewer to scene space.
-  Offset toScene(Offset screenPoint) => screenPoint / zoom + scrollOffset;
+  Offset toScene(Offset screenPoint) =>
+      screenPoint / zoom + scrollOffset - Offset(0, topInset);
 
   /// Converts a scene-space point back to the screen.
-  Offset toScreen(Offset scenePoint) => (scenePoint - scrollOffset) * zoom;
+  Offset toScreen(Offset scenePoint) =>
+      (scenePoint + Offset(0, topInset) - scrollOffset) * zoom;
 
   /// Where a rectangle in page [index]'s displayed space sits in scene space.
   Rect pageRectToScene(int index, Rect displayRect) {

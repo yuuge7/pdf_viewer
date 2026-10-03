@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdf_viewer/main.dart';
 import 'package:pdf_viewer/screens/home_screen.dart';
+import 'package:pdf_viewer/services/app_settings.dart';
 import 'package:pdf_viewer/services/document_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -41,7 +42,42 @@ void main() {
       await pumpHome(tester);
 
       expect(find.text('View All'), findsNothing);
-      expect(find.byIcon(Icons.settings_outlined), findsNothing);
+    });
+
+    testWidgets('settings open and switch the appearance', (tester) async {
+      await tester.pumpWidget(const PdfViewerApp());
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Settings'));
+      await tester.pumpAndSettle();
+      expect(find.text('Appearance'), findsOneWidget);
+
+      await tester.tap(find.text('Dark'));
+      await tester.pumpAndSettle();
+      expect(AppSettings.themeMode.value, ThemeMode.dark);
+      expect(
+        Theme.of(tester.element(find.text('Appearance'))).brightness,
+        Brightness.dark,
+      );
+      await AppSettings.setThemeMode(ThemeMode.system);
+    });
+
+    testWidgets('offers every way to start a document', (tester) async {
+      await pumpHome(tester);
+
+      for (final String label in [
+        'Scan',
+        'Images',
+        'Merge',
+        'New PDF',
+        'HTML',
+        'PDF tools',
+        'Read text',
+        'New sheet',
+        'Edit image',
+      ]) {
+        expect(find.text(label), findsOneWidget, reason: label);
+      }
     });
   });
 

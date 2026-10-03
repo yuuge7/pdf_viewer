@@ -300,12 +300,13 @@ class DocumentService {
   /// or null if the user cancelled.
   static Future<DocumentRef?> saveCopy(
     String suggestedName,
-    File source,
-  ) async {
+    File source, {
+    String mimeType = 'application/pdf',
+  }) async {
     if (!supportsSaf) return null;
     final result = await _channel.invokeMapMethod<String, dynamic>(
       'createDocument',
-      {'name': suggestedName, 'sourcePath': source.path},
+      {'name': suggestedName, 'sourcePath': source.path, 'mime': mimeType},
     );
     if (result == null) return null;
     return DocumentRef(
@@ -403,6 +404,77 @@ class DocumentService {
       'outPath': outPath,
       'width': width,
       'quality': quality,
+    });
+  }
+
+  /// Every type the app can do something with, for [pickAny].
+  static const List<String> openableTypes = [
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.oasis.opendocument.text',
+    'application/rtf',
+    'text/rtf',
+    'text/plain',
+    'text/csv',
+    'text/comma-separated-values',
+    'text/html',
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'image/gif',
+    'image/bmp',
+  ];
+
+  /// Opens the system picker for anything in [types], and returns what was
+  /// chosen with the type its provider gave it. Null if cancelled.
+  ///
+  /// A lasting grant is taken, as for a PDF; the caller releases it for a
+  /// file that is only read once.
+  static Future<IncomingDocument?> pickAny({
+    List<String> types = openableTypes,
+  }) async {
+    if (!supportsSaf) {
+      final DocumentRef? ref = await pick();
+      return ref == null ? null : IncomingDocument(ref);
+    }
+    return _incomingFrom(
+      await _channel.invokeMapMethod<String, dynamic>('pickDocument', {
+        'mimes': types,
+      }),
+    );
+  }
+
+  /// Hands [text] to whichever app on the device translates.
+  ///
+  /// Throws a [PlatformException] when there is none.
+  static Future<void> translate(String text) {
+    return _channel.invokeMethod<void>('translateText', {'text': text});
+  }
+
+  /// Looks [text] up on the web, in the browser or search app.
+  static Future<void> webSearch(String text) {
+    return _channel.invokeMethod<void>('webSearch', {'text': text});
+  }
+
+  /// Lays [html] out on pages and writes the PDF to [outPath].
+  ///
+  /// Rendered by the system web view with scripts off and the network
+  /// blocked, so only what the HTML itself carries appears.
+  static Future<void> htmlToPdf(
+    String html, {
+    required String outPath,
+    bool landscape = false,
+    bool letter = false,
+    bool margins = true,
+  }) {
+    return _channel.invokeMethod<void>('htmlToPdf', {
+      'html': html,
+      'outPath': outPath,
+      'landscape': landscape,
+      'letter': letter,
+      'margins': margins,
     });
   }
 

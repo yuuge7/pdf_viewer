@@ -608,6 +608,26 @@ class PdfTools {
     }
   }
 
+  /// Removes every outbox now. Returns how many there were.
+  ///
+  /// Only safe with no document open: one converted on the way in lives in
+  /// an outbox until it is saved.
+  static Future<int> clearOutboxes() async {
+    int removed = 0;
+    try {
+      final Directory temp = await getTemporaryDirectory();
+      final Directory exports = Directory('${temp.path}/exports');
+      if (!exports.existsSync()) return 0;
+      await for (final FileSystemEntity entity in exports.list()) {
+        await entity.delete(recursive: true);
+        removed++;
+      }
+    } catch (_) {
+      // Whatever could not go now goes with the daily sweep.
+    }
+    return removed;
+  }
+
   static String baseNameOf(String name) {
     final int dot = name.lastIndexOf('.');
     return dot > 0 ? name.substring(0, dot) : name;

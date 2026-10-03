@@ -54,6 +54,14 @@
                 <data android:scheme="file"/>
                 <data android:mimeType="application/pdf"/>
                 <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/>
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation"/>
+                <data android:mimeType="application/vnd.oasis.opendocument.text"/>
+                <data android:mimeType="application/rtf"/>
+                <data android:mimeType="text/rtf"/>
+                <data android:mimeType="text/csv"/>
+                <data android:mimeType="text/comma-separated-values"/>
+                <data android:mimeType="text/html"/>
                 <data android:mimeType="text/plain"/>
                 <data android:mimeType="image/jpeg"/>
                 <data android:mimeType="image/png"/>
@@ -87,6 +95,11 @@
                 <data android:pathSuffix=".PDF"/>
                 <data android:pathSuffix=".docx"/>
                 <data android:pathSuffix=".DOCX"/>
+                <data android:pathSuffix=".xlsx"/>
+                <data android:pathSuffix=".XLSX"/>
+                <data android:pathSuffix=".pptx"/>
+                <data android:pathSuffix=".odt"/>
+                <data android:pathSuffix=".rtf"/>
                 <data android:pathPattern=".*\\.pdf"/>
                 <data android:pathPattern=".*\\..*\\.pdf"/>
                 <data android:pathPattern=".*\\..*\\..*\\.pdf"/>
@@ -97,6 +110,16 @@
                 <data android:pathPattern=".*\\..*\\..*\\.docx"/>
                 <data android:pathPattern=".*\\..*\\..*\\..*\\.docx"/>
                 <data android:pathPattern=".*\\.DOCX"/>
+                <data android:pathPattern=".*\\.xlsx"/>
+                <data android:pathPattern=".*\\..*\\.xlsx"/>
+                <data android:pathPattern=".*\\..*\\..*\\.xlsx"/>
+                <data android:pathPattern=".*\\.XLSX"/>
+                <data android:pathPattern=".*\\.pptx"/>
+                <data android:pathPattern=".*\\..*\\.pptx"/>
+                <data android:pathPattern=".*\\.odt"/>
+                <data android:pathPattern=".*\\..*\\.odt"/>
+                <data android:pathPattern=".*\\.rtf"/>
+                <data android:pathPattern=".*\\..*\\.rtf"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

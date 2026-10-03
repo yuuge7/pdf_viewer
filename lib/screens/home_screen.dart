@@ -2,17 +2,31 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../services/document_import.dart';
 import '../services/document_service.dart';
+import '../services/flow_document.dart';
+import '../services/ocr_service.dart';
+import '../services/pdf_stamps.dart';
+import '../services/pdf_tools.dart';
 import '../services/recent_documents.dart';
 import '../services/scan_service.dart';
+import '../services/sheet/workbook.dart';
+import '../services/sheet/xlsx_file.dart';
 import '../widgets/document_actions.dart';
 import '../widgets/document_details_sheet.dart';
 import '../widgets/export_sheet.dart';
+import '../widgets/tool_option_sheets.dart';
+import 'html_to_pdf_screen.dart';
+import 'image_editor_screen.dart';
 import 'merge_screen.dart';
 import 'pdf_editor_screen.dart';
 import 'scan_screen.dart';
+import 'settings_screen.dart';
+import 'spreadsheet_screen.dart';
+import 'text_extract_screen.dart';
 
 enum _Shelf { recent, favorites }
 
@@ -92,6 +106,10 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Brings in a file that is not a PDF: a Word or text file is converted
   /// and opened as an unsaved document, a picture starts a scan session.
   Future<void> _import(DocumentRef source, ImportKind kind) async {
+    if (kind == ImportKind.sheet) {
+      await _openSheet(source);
+      return;
+    }
     // The file is read once, here. Nothing will reopen it, so a lasting
     // grant on it, where the sending app offered one, goes straight back.
     unawaited(DocumentService.release(source));
@@ -99,10 +117,28 @@ class _HomeScreenState extends State<HomeScreen> {
       _showMessage('ProPDF Studio cannot open "${source.name}".');
       return;
     }
+    if (kind == ImportKind.legacyOffice) {
+      _showMessage(
+        '"${source.name}" is in an older Office format. Save it as .docx, '
+        '.xlsx or .pptx first.',
+      );
+      return;
+    }
 
     _isImporting = true;
     try {
       if (kind == ImportKind.image) {
+        // A picture can be worked on as a picture, or become a page.
+        final bool? edit = await _askPictureUse(source.name);
+        if (edit == null || !mounted) return;
+        if (edit) {
+          await ImageEditorScreen.open(
+            context,
+            path: source.path,
+            name: source.name,
+          );
+          return;
+        }
         final File photo = await _withProgress(
           'Preparing ${source.name}',
           () => DocumentImport.preparePhoto(source.file),
@@ -111,18 +147,35 @@ class _HomeScreenState extends State<HomeScreen> {
         await _scan(ScanSource.gallery, initialImages: [photo.path]);
         return;
       }
+      if (kind == ImportKind.html) {
+        if (await source.file.length() > HtmlToPdfScreen.maxBytes) {
+          throw const ImportException('This page is too large to convert.');
+        }
+        final String html = FlowDocument.decodeText(
+          await source.file.readAsBytes(),
+        );
+        if (!mounted) return;
+        await _htmlToPdf(initialHtml: html, sourceName: source.name);
+        return;
+      }
 
       final DocumentRef converted = await _withProgress(
         'Converting ${source.name} to PDF',
         () => DocumentImport.toPdf(source, kind),
       );
       if (!mounted) return;
-      _showMessage(
-        kind == ImportKind.word
-            ? 'Converted from Word with a simplified layout. '
-                  'Use Save a copy to keep the PDF.'
-            : 'Converted to PDF. Use Save a copy to keep it.',
-      );
+      _showMessage(switch (kind) {
+        ImportKind.text => 'Converted to PDF. Use Save a copy to keep it.',
+        ImportKind.slides =>
+          'Converted from PowerPoint: the text, pictures and tables of each '
+              'slide, in order. Use Save a copy to keep the PDF.',
+        ImportKind.word =>
+          'Converted from Word with a simplified layout. '
+              'Use Save a copy to keep the PDF.',
+        _ =>
+          'Converted with a simplified layout. '
+              'Use Save a copy to keep the PDF.',
+      });
       await _open(converted);
     } on ImportException catch (e) {
       _showMessage('Could not open "${source.name}". ${e.message}');
@@ -205,13 +258,15 @@ class _HomeScreenState extends State<HomeScreen> {
     await _loadRecentFiles();
   }
 
-  Future<void> _open(DocumentRef ref) async {
+  Future<void> _open(DocumentRef ref, {bool openTools = false}) async {
     if (!mounted) return;
     _isEditorOpen = true;
     try {
       await Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => PdfEditorScreen(document: ref)),
+        MaterialPageRoute(
+          builder: (_) => PdfEditorScreen(document: ref, openTools: openTools),
+        ),
       );
     } finally {
       _isEditorOpen = false;
@@ -242,6 +297,11 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final DocumentRef? resolved = await _resolve(ref);
       if (resolved == null || !mounted) return;
+      if (_isSheet(resolved)) {
+        setState(() => _isLoading = false);
+        await _openSheet(resolved);
+        return;
+      }
       await _addRecentFile(resolved);
       await _open(resolved);
     } catch (e) {
@@ -253,19 +313,199 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _pickPDF() async {
+  /// Opens whatever the user picks: a PDF as it is, anything else through
+  /// the same conversion as a file handed over by another app.
+  Future<void> _pickDocument() async {
     setState(() => _isLoading = true);
     try {
-      final DocumentRef? ref = await DocumentService.pick();
-      if (!mounted || ref == null) return;
-      await _addRecentFile(ref);
-      await _open(ref);
+      final IncomingDocument? picked = await DocumentService.pickAny();
+      if (!mounted || picked == null) return;
+      setState(() => _isLoading = false);
+      await _openIncoming(picked);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('Error selecting file: $e')));
     } finally {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  /// Picks a PDF and opens it with the tools sheet already up.
+  Future<void> _pdfTools() async {
+    setState(() => _isLoading = true);
+    try {
+      final DocumentRef? ref = await DocumentService.pick();
+      if (!mounted || ref == null) return;
+      await _addRecentFile(ref);
+      await _open(ref, openTools: true);
+    } catch (e) {
+      _showMessage('Error selecting file: $e');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  /// Opens a workbook, or a CSV as one, in the spreadsheet editor.
+  Future<void> _openSheet(DocumentRef source) async {
+    if (_isImporting) return;
+    _isImporting = true;
+    try {
+      final (Workbook book, bool isWorkbook) = await _withProgress(
+        'Opening ${source.name}',
+        () => DocumentImport.openSheet(source.file),
+      );
+      if (!mounted) return;
+      // A workbook the app may write to is worth finding again; a CSV is
+      // read once and saved as something else.
+      final bool keeps = isWorkbook && source.canWrite && source.uri != null;
+      if (keeps) {
+        await _addRecentFile(source);
+      } else {
+        unawaited(DocumentService.release(source));
+      }
+      if (!mounted) return;
+      await SpreadsheetScreen.open(
+        context,
+        book: book,
+        name: source.name,
+        document: keeps ? source : null,
+        savesInPlace: keeps,
+      );
+      if (mounted) await _loadRecentFiles();
+    } on ImportException catch (e) {
+      _showMessage('Could not open "${source.name}". ${e.message}');
+    } catch (e) {
+      _showMessage('Could not open "${source.name}": $e');
+    } finally {
+      _isImporting = false;
+    }
+  }
+
+  Future<void> _newSheet() async {
+    await SpreadsheetScreen.open(
+      context,
+      book: XlsxFile.blank(),
+      name: 'Untitled.xlsx',
+    );
+    if (mounted) await _loadRecentFiles();
+  }
+
+  /// Starts a document from blank pages.
+  Future<void> _newPdf() async {
+    final NewPdfOptions? options = await NewPdfSheet.show(context);
+    if (options == null || !mounted) return;
+    try {
+      final Directory outbox = await PdfTools.newOutbox();
+      final File out = File('${outbox.path}/Untitled.pdf');
+      await out.writeAsBytes(
+        await PdfStamps.renderBlank(options.pageSize, options.pageCount),
+        flush: true,
+      );
+      await _open(DocumentRef.unsaved(path: out.path, name: 'Untitled.pdf'));
+    } catch (e) {
+      _showMessage('Could not create the document: $e');
+    }
+  }
+
+  Future<void> _htmlToPdf({String initialHtml = '', String? sourceName}) async {
+    final HtmlPdf? converted = await HtmlToPdfScreen.open(
+      context,
+      initialHtml: initialHtml,
+      sourceName: sourceName,
+    );
+    if (converted == null || !mounted) return;
+    _showMessage(
+      converted.faithful
+          ? 'Converted to PDF. Use Save a copy to keep it.'
+          : 'Converted with a simplified layout. Use Save a copy to keep it.',
+    );
+    await _open(converted.document);
+  }
+
+  /// Asks what a picture was opened for: true to edit it, false to make a
+  /// PDF of it, null if dismissed.
+  Future<bool?> _askPictureUse(String name) {
+    return showModalBottomSheet<bool>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+              subtitle: const Text('What would you like to do with it?'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.tune_rounded),
+              title: const Text('Edit the picture'),
+              subtitle: const Text('Crop, adjust, draw, hide, cut out'),
+              onTap: () => Navigator.of(sheetContext).pop(true),
+            ),
+            ListTile(
+              leading: const Icon(Icons.picture_as_pdf_outlined),
+              title: const Text('Make a PDF of it'),
+              subtitle: const Text('Crop it as a page, add more, save'),
+              onTap: () => Navigator.of(sheetContext).pop(false),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Picks a photo and opens it in the picture editor.
+  Future<void> _editPicture() async {
+    final XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    } on PlatformException catch (e) {
+      _showMessage(e.message ?? 'Could not open the gallery.');
+      return;
+    }
+    if (picked == null || !mounted) return;
+    await ImageEditorScreen.open(context, path: picked.path, name: picked.name);
+  }
+
+  /// Reads the text out of a photo, without making a document of it.
+  Future<void> _readPicture() async {
+    if (!OcrService.isAvailable) {
+      _showMessage('Text recognition needs Android.');
+      return;
+    }
+    final XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+    } on PlatformException catch (e) {
+      _showMessage(e.message ?? 'Could not open the gallery.');
+      return;
+    }
+    if (picked == null || !mounted) return;
+    try {
+      final OcrPage page = await _withProgress('Reading the picture', () async {
+        // Upright first: the recogniser reads what the pixels show, and a
+        // phone photo keeps which way is up in a tag beside them.
+        final File upright = await DocumentImport.preparePhoto(
+          File(picked!.path),
+        );
+        return OcrService.recogniseImage(upright.path);
+      });
+      if (!mounted) return;
+      if (page.text.trim().isEmpty) {
+        _showMessage('No text could be recognised in that picture.');
+        return;
+      }
+      await RecognisedTextScreen.open(
+        context,
+        text: page.text,
+        sourceName: picked.name,
+      );
+    } on ImportException catch (e) {
+      _showMessage(e.message);
+    } catch (e) {
+      _showMessage('Could not read the picture: $e');
     }
   }
 
@@ -361,6 +601,13 @@ class _HomeScreenState extends State<HomeScreen> {
           style: TextStyle(fontWeight: FontWeight.w600),
         ),
         centerTitle: false,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: 'Settings',
+            onPressed: () => SettingsScreen.open(context),
+          ),
+        ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -385,39 +632,7 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 40),
               _buildOpenCard(theme),
               const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: _buildQuickAction(
-                      theme,
-                      icon: Icons.document_scanner_rounded,
-                      title: 'Scan',
-                      subtitle: 'Camera to PDF',
-                      onTap: () => _scan(ScanSource.camera),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _buildQuickAction(
-                      theme,
-                      icon: Icons.photo_library_rounded,
-                      title: 'Images',
-                      subtitle: 'Photos to PDF',
-                      onTap: () => _scan(ScanSource.gallery),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _buildQuickAction(
-                      theme,
-                      icon: Icons.library_add_rounded,
-                      title: 'Merge',
-                      subtitle: 'PDFs into one',
-                      onTap: _merge,
-                    ),
-                  ),
-                ],
-              ),
+              _buildTools(theme),
               const SizedBox(height: 40),
               Row(
                 children: [
@@ -482,9 +697,91 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// Everything that starts from nothing or from another kind of file.
+  Widget _buildTools(ThemeData theme) {
+    final List<Widget> tools = [
+      _buildQuickAction(
+        theme,
+        icon: Icons.document_scanner_rounded,
+        title: 'Scan',
+        subtitle: 'Camera to PDF',
+        onTap: () => _scan(ScanSource.camera),
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.photo_library_rounded,
+        title: 'Images',
+        subtitle: 'Photos to PDF',
+        onTap: () => _scan(ScanSource.gallery),
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.library_add_rounded,
+        title: 'Merge',
+        subtitle: 'PDFs into one',
+        onTap: _merge,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.note_add_rounded,
+        title: 'New PDF',
+        subtitle: 'Blank pages',
+        onTap: _newPdf,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.code_rounded,
+        title: 'HTML',
+        subtitle: 'Page to PDF',
+        onTap: _htmlToPdf,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.apps_rounded,
+        title: 'PDF tools',
+        subtitle: 'Lock, stamp',
+        onTap: _pdfTools,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.text_snippet_rounded,
+        title: 'Read text',
+        subtitle: 'From a picture',
+        onTap: _readPicture,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.photo_filter_rounded,
+        title: 'Edit image',
+        subtitle: 'Crop, adjust…',
+        onTap: _editPicture,
+      ),
+      _buildQuickAction(
+        theme,
+        icon: Icons.table_chart_rounded,
+        title: 'New sheet',
+        subtitle: 'Spreadsheet',
+        onTap: _newSheet,
+      ),
+    ];
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const double gap = 12;
+        final double width = (constraints.maxWidth - gap * 2) / 3;
+        return Wrap(
+          spacing: gap,
+          runSpacing: gap,
+          children: [
+            for (final Widget tool in tools) SizedBox(width: width, child: tool),
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildOpenCard(ThemeData theme) {
     return InkWell(
-      onTap: _isLoading ? null : _pickPDF,
+      onTap: _isLoading ? null : _pickDocument,
       borderRadius: BorderRadius.circular(24),
       child: Container(
         width: double.infinity,
@@ -524,7 +821,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Tap to select a PDF from your device',
+              'PDF, Office files, text, web pages, pictures',
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: Colors.white.withValues(alpha: 0.8),
               ),
@@ -625,6 +922,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// Recent Files holds workbooks too; they open in their own editor.
+  static bool _isSheet(DocumentRef ref) {
+    final String name = ref.name.toLowerCase();
+    return name.endsWith('.xlsx') || name.endsWith('.xlsm');
+  }
+
   Widget _buildRecentTile(ThemeData theme, DocumentRef ref) {
     final bool favorite = _favorites.any((f) => f.key == ref.key);
     return ListTile(
@@ -641,7 +944,9 @@ class _HomeScreenState extends State<HomeScreen> {
             borderRadius: BorderRadius.circular(12),
           ),
           child: Icon(
-            Icons.picture_as_pdf_rounded,
+            _isSheet(ref)
+                ? Icons.table_chart_rounded
+                : Icons.picture_as_pdf_rounded,
             color: theme.colorScheme.primary,
           ),
         ),
@@ -672,14 +977,19 @@ class _HomeScreenState extends State<HomeScreen> {
         itemBuilder: (_) => [
           _menuItem(_TileAction.rename, Icons.drive_file_rename_outline, 'Rename'),
           _menuItem(_TileAction.share, Icons.ios_share_rounded, 'Share'),
-          if (DocumentService.supportsSaf)
+          if (DocumentService.supportsSaf && !_isSheet(ref))
             _menuItem(_TileAction.print, Icons.print_outlined, 'Print'),
           _menuItem(
             _TileAction.favorite,
             favorite ? Icons.star_rounded : Icons.star_border_rounded,
             favorite ? 'Remove from Favorites' : 'Add to Favorites',
           ),
-          _menuItem(_TileAction.details, Icons.info_outline_rounded, 'Details'),
+          if (!_isSheet(ref))
+            _menuItem(
+              _TileAction.details,
+              Icons.info_outline_rounded,
+              'Details',
+            ),
           if (_shelf == _Shelf.recent)
             _menuItem(
               _TileAction.forget,

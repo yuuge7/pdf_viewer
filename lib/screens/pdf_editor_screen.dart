@@ -1,11 +1,14 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' show ImageDescriptor, ImmutableBuffer, PointMode;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart' show Ticker;
+import 'package:flutter/scheduler.dart'
+    show SchedulerBinding, SchedulerPhase, Ticker;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:syncfusion_flutter_core/theme.dart'
     show SfPdfViewerTheme, SfPdfViewerThemeData;
 import 'package:syncfusion_flutter_pdf/pdf.dart'
@@ -13,11 +16,18 @@ import 'package:syncfusion_flutter_pdf/pdf.dart'
 // The viewer exports its own PdfTextLine (search results); ours is the
 // extracted-text model.
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart' hide PdfTextLine;
+import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart'
+    as viewer
+    show PdfTextLine;
 
+import '../services/document_import.dart';
 import '../services/document_service.dart';
 import '../services/docx_writer.dart';
+import '../services/ocr_service.dart';
+import '../services/pdf_annotations.dart';
 import '../services/pdf_page_geometry.dart';
 import '../services/pdf_service.dart';
+import '../services/pdf_stamps.dart';
 import '../services/pdf_tools.dart';
 import '../services/reader_settings.dart';
 import '../services/recent_documents.dart';
@@ -35,6 +45,7 @@ import '../widgets/view_settings_sheet.dart';
 import 'manage_pages_screen.dart';
 import 'merge_screen.dart';
 import 'signature_screen.dart';
+import 'text_extract_screen.dart';
 
 enum EditTool {
   none,
@@ -47,6 +58,14 @@ enum EditTool {
   underline,
   strikethrough,
   draw,
+
+  /// A wide, see-through pen.
+  marker,
+
+  /// A line, arrow, rectangle or ellipse, dragged out corner to corner.
+  shape,
+  note,
+  eraser,
 }
 
 enum EditTab {
@@ -81,12 +100,20 @@ class _PendingStroke {
   final Color color;
   final double width;
 
+  /// Below 1 for the marker.
+  final double opacity;
+
+  /// Set for a shape, whose two points are the ends of the drag.
+  final ShapeKind? shape;
+
   const _PendingStroke({
     required this.scenePoints,
     required this.pagePoints,
     required this.pageIndex,
     required this.color,
     required this.width,
+    this.opacity = 1,
+    this.shape,
   });
 }
 
@@ -145,7 +172,15 @@ class _Placement {
 class PdfEditorScreen extends StatefulWidget {
   final DocumentRef document;
 
-  const PdfEditorScreen({super.key, required this.document});
+  /// Opens with the tools sheet already up, for a document picked from the
+  /// home screen in order to do something to it.
+  final bool openTools;
+
+  const PdfEditorScreen({
+    super.key,
+    required this.document,
+    this.openTools = false,
+  });
 
   @override
   State<PdfEditorScreen> createState() => _PdfEditorScreenState();
@@ -248,6 +283,47 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     MarkupKind.strikethrough: Colors.red,
   };
 
+  /// How much of what is under the marker shows through it.
+  static const double _markerOpacity = 0.4;
+  static const Map<String, double> _markerWidths = {
+    'S': 8,
+    'M': 14,
+    'L': 20,
+    'XL': 28,
+  };
+  Color _markerColor = Colors.yellow;
+  double _markerWidth = 14;
+  ShapeKind _shapeKind = ShapeKind.rectangle;
+  Color _shapeColor = Colors.red;
+  double _shapeWidth = 2;
+
+  /// Annotations the eraser can remove, for the file they were read from.
+  List<PdfMark> _marks = const [];
+  String? _marksPath;
+  bool _loadingMarks = false;
+
+  // --- Passwords and what the viewer holds -----------------------------------
+
+  /// The password the document is saved with, or null for none.
+  ///
+  /// A protected document is decrypted once on the way in and worked on as a
+  /// plain copy, because nothing else here — the page renderer, text
+  /// extraction, every edit — reads an encrypted file. It is encrypted
+  /// again on its way out: see [_fileToWrite].
+  String? _password;
+
+  /// True when [_password] no longer matches the document on disk.
+  bool _securityChanged = false;
+
+  /// True while the viewer holds something [_currentFile] does not: a form
+  /// field filled in, a note reworded. See [_flushViewer].
+  bool _viewerDirty = false;
+
+  /// Text the user has selected in the viewer, and where it is on screen.
+  String? _selectedText;
+  Rect? _selectionRegion;
+  final GlobalKey _viewportKey = GlobalKey();
+
   // --- Reading ---------------------------------------------------------------
 
   ReaderSettings _settings = const ReaderSettings();
@@ -303,6 +379,11 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     final ReaderSettings settings = await ReaderSettings.load();
     final bool favorite = await FavoriteDocuments.contains(_doc);
     if (!mounted) return;
+    if (!await _unlockIfNeeded()) {
+      if (mounted) Navigator.of(context).pop();
+      return;
+    }
+    if (!mounted) return;
     // The viewer is not built until this lands, so it opens in the saved
     // layout instead of opening once and being rebuilt.
     setState(() {
@@ -311,10 +392,126 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       _settingsLoaded = true;
     });
     if (settings.keepScreenOn) DocumentService.setKeepScreenOn(true);
+    if (widget.openTools) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showTools();
+      });
+    }
+  }
+
+  /// Asks for the password of a protected document and swaps in a decrypted
+  /// working copy. Returns false when the user gives up.
+  Future<bool> _unlockIfNeeded() async {
+    final Uint8List bytes;
+    try {
+      bytes = await _currentFile.readAsBytes();
+      if (await PdfStamps.probe(bytes) != PdfLock.locked) return true;
+    } catch (_) {
+      // Unreadable; the viewer gets to say so.
+      return true;
+    }
+    bool wrong = false;
+    while (true) {
+      if (!mounted) return false;
+      final String? password = await askPassword(
+        context,
+        _doc.name,
+        wrong: wrong,
+      );
+      if (password == null) return false;
+      try {
+        final Uint8List open = await PdfStamps.renderUnlock(bytes, password);
+        final Directory directory = await getApplicationDocumentsDirectory();
+        final File copy = File(
+          '${directory.path}/edited_${DateTime.now().microsecondsSinceEpoch}.pdf',
+        );
+        await copy.writeAsBytes(open, flush: true);
+        _password = password;
+        _currentFile = copy;
+        _history[0] = copy;
+        _savedPath = copy.path;
+        return true;
+      } on PdfEditException {
+        wrong = true;
+      } catch (e) {
+        _showMessage('Could not open ${_doc.name}: $e');
+        return false;
+      }
+    }
+  }
+
+  /// [_currentFile] as it should leave the app: encrypted when the document
+  /// has a password.
+  Future<File> _fileToWrite() async {
+    final String? password = _password;
+    if (password == null) return _currentFile;
+    final Uint8List locked = await PdfStamps.renderProtect(
+      await _currentFile.readAsBytes(),
+      password,
+    );
+    final Directory outbox = await PdfTools.newOutbox();
+    final File out = File('${outbox.path}/protected.pdf');
+    await out.writeAsBytes(locked, flush: true);
+    return out;
+  }
+
+  /// Writes what only the viewer holds — form fields filled in, a note
+  /// reworded through its own popup — into a new history file.
+  ///
+  /// Every edit and every export reads [_currentFile], so this runs before
+  /// any of them, or the form would silently go back to how it was opened.
+  /// Returns false when it could not be kept.
+  Future<bool> _flushViewer() async {
+    if (!_viewerDirty) return true;
+    setState(() => _isLoading = true);
+    try {
+      final List<int> bytes = await _pdfViewerController.saveDocument();
+      final Directory directory = await getApplicationDocumentsDirectory();
+      final File file = File(
+        '${directory.path}/edited_${DateTime.now().microsecondsSinceEpoch}.pdf',
+      );
+      await file.writeAsBytes(bytes, flush: true);
+      if (!mounted) return false;
+      _viewerDirty = false;
+      _swapDocument(file, addToHistory: true);
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLoading = false);
+        _showMessage('Could not keep what you filled in: $e');
+      }
+      return false;
+    }
+  }
+
+  void _markViewerDirty() {
+    if (!_viewerDirty && mounted) setState(() => _viewerDirty = true);
   }
 
   bool get _hasPendingAnnotations =>
       _pendingDrawStrokes.isNotEmpty || _pendingHighlights.isNotEmpty;
+
+  /// Draw, marker and shapes share one pending batch, as the markup tools
+  /// share theirs.
+  static bool _isPen(EditTool tool) =>
+      tool == EditTool.draw ||
+      tool == EditTool.marker ||
+      tool == EditTool.shape;
+
+  Color get _penColor => switch (_activeTool) {
+    EditTool.marker => _markerColor,
+    EditTool.shape => _shapeColor,
+    _ => _selectedDrawColor,
+  };
+
+  double get _penWidth => switch (_activeTool) {
+    EditTool.marker => _markerWidth,
+    EditTool.shape => _shapeWidth,
+    _ => _selectedDrawWidth,
+  };
+
+  double get _penOpacity =>
+      _activeTool == EditTool.marker ? _markerOpacity : 1;
 
   static bool _isMarkup(EditTool tool) =>
       tool == EditTool.highlight ||
@@ -335,7 +532,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   void _syncOverlayTicker() {
     final bool shouldTick =
         (_panMode && _hasPendingAnnotations) ||
-        _activeTool == EditTool.editText;
+        _activeTool == EditTool.editText ||
+        _activeTool == EditTool.eraser;
     if (shouldTick == _overlayTicker.isActive) return;
     if (shouldTick) {
       _overlayTicker.start();
@@ -384,6 +582,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       pageSpacing: kPageSpacing,
       zoom: _pdfViewerController.zoomLevel,
       scrollOffset: _pdfViewerController.scrollOffset,
+      viewportHeight: _viewportHeight,
     );
     return geometry.isUsable ? geometry : null;
   }
@@ -392,7 +591,15 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message), action: action));
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          action: action,
+          // One with an action would otherwise sit over the tool bar until
+          // swiped away.
+          persist: false,
+        ),
+      );
   }
 
   /// Runs [task] behind the loading scrim and reports failure, returning null
@@ -495,19 +702,52 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     if (_pendingDrawStrokes.isEmpty) return;
     setState(() => _isLoading = true);
 
-    final Map<int, List<DrawStroke>> byPage = {};
+    final Map<int, List<DrawStroke>> strokes = {};
+    final Map<int, List<ShapeMark>> shapes = {};
     for (final _PendingStroke s in _pendingDrawStrokes) {
-      byPage
-          .putIfAbsent(s.pageIndex, () => [])
-          .add(
-            DrawStroke(points: s.pagePoints, color: s.color, width: s.width),
-          );
+      final ShapeKind? kind = s.shape;
+      if (kind == null) {
+        strokes
+            .putIfAbsent(s.pageIndex, () => [])
+            .add(
+              DrawStroke(
+                points: s.pagePoints,
+                color: s.color,
+                width: s.width,
+                opacity: s.opacity,
+              ),
+            );
+      } else {
+        shapes
+            .putIfAbsent(s.pageIndex, () => [])
+            .add(
+              ShapeMark(
+                kind: kind,
+                start: s.pagePoints.first,
+                end: s.pagePoints.last,
+                color: s.color,
+                width: s.width,
+              ),
+            );
+      }
     }
 
     final PdfEditResult result = await _applyPerPage(
-      byPage.keys,
-      (file, pageIndex) =>
-          PdfService.addDrawAnnotation(file, pageIndex, byPage[pageIndex]!),
+      {...strokes.keys, ...shapes.keys},
+      (file, pageIndex) async {
+        final List<DrawStroke>? drawn = strokes[pageIndex];
+        final List<ShapeMark>? shaped = shapes[pageIndex];
+        PdfEditResult step = PdfEditResult.success(file);
+        if (drawn != null) {
+          step = await PdfService.addDrawAnnotation(file, pageIndex, drawn);
+          if (!step.isSuccess || shaped == null) return step;
+        }
+        // Two passes for a page with both, each through its own writer.
+        final File between = step.file!;
+        step = await PdfAnnotations.addShapes(between, pageIndex, shaped!);
+        if (between.path != file.path) await _deleteAll([between]);
+        return step;
+      },
     );
 
     if (!mounted) return;
@@ -565,14 +805,28 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
   // --- History ---------------------------------------------------------------
 
-  void _handleResult(PdfEditResult result, String successMessage) {
+  /// [undoable] offers Undo with the message, for edits made from read
+  /// mode, where there is no undo button on screen.
+  void _handleResult(
+    PdfEditResult result,
+    String successMessage, {
+    bool undoable = false,
+  }) {
     if (!result.isSuccess) {
-      setState(() => _isLoading = false);
+      setState(() {
+        _isLoading = false;
+        _busyLabel = null;
+      });
       _showMessage(result.error!);
       return;
     }
     _swapDocument(result.file!, addToHistory: true);
-    _showMessage(successMessage);
+    _showMessage(
+      successMessage,
+      action: undoable
+          ? SnackBarAction(label: 'Undo', onPressed: _undo)
+          : null,
+    );
   }
 
   void _swapDocument(File file, {required bool addToHistory}) =>
@@ -635,6 +889,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       // A search belongs to the controller that ran it.
       _searchResult?.removeListener(_onSearchResultChanged);
       _searchResult = null;
+
+      // So does a selection, and anything typed into the old viewer that
+      // was not flushed first is gone with it.
+      _selectedText = null;
+      _selectionRegion = null;
+      _viewerDirty = false;
     });
 
     // Deferred: the outgoing SfPdfViewer stays mounted until the end of this
@@ -664,9 +924,11 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   /// opened and moves forward on each successful save.
   late String _savedPath;
 
-  bool get _hasUnsavedChanges => _currentFile.path != _savedPath;
+  bool get _hasUnsavedChanges =>
+      _currentFile.path != _savedPath || _securityChanged || _viewerDirty;
 
   Future<void> _savePdf() async {
+    if (!await _flushViewer() || !mounted) return;
     // A document converted on the way in exists nowhere yet, edited or not:
     // saving it means choosing where it goes.
     if (_doc.isUnsaved) {
@@ -687,13 +949,16 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
     setState(() => _isLoading = true);
     try {
-      await DocumentService.write(_doc, _currentFile);
+      await DocumentService.write(_doc, await _fileToWrite());
       if (!mounted) return;
       // The document on disk now matches this file, so Save reports "no
       // changes" until the next edit. History is deliberately left alone --
       // rewriting _history[0] would make Undo jump to a file the user never
       // navigated to.
-      setState(() => _savedPath = _currentFile.path);
+      setState(() {
+        _savedPath = _currentFile.path;
+        _securityChanged = false;
+      });
       _showMessage('Saved to ${_doc.name}');
     } catch (e) {
       if (!mounted) return;
@@ -708,11 +973,12 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       _showMessage('Saving a copy is not supported on this platform.');
       return;
     }
+    if (!await _flushViewer() || !mounted) return;
     setState(() => _isLoading = true);
     try {
       final DocumentRef? saved = await DocumentService.saveCopy(
         _suggestedCopyName(),
-        _currentFile,
+        await _fileToWrite(),
       );
       if (!mounted) return;
       if (saved == null) return; // Cancelled.
@@ -727,6 +993,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         setState(() {
           _doc = saved;
           _savedPath = _currentFile.path;
+          _securityChanged = false;
         });
         _showMessage('Saved as ${saved.name}');
         return;
@@ -810,6 +1077,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   // --- Edit mode -------------------------------------------------------------
 
   Future<void> _enterEditMode(EditTab tab, {EditTool? tool}) async {
+    if (!await _flushViewer() || !mounted) return;
     if (_isSearching) _closeSearch();
     // Annotation placement maps gestures onto a continuous vertical stack of
     // pages; any other layout has to give way while editing.
@@ -961,6 +1229,19 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
                     'through; draw freehand with the pen. Use the hand to '
                     'scroll without drawing. Nothing is written until you '
                     'tap Apply or switch tools.',
+              ),
+              item(
+                Icons.category_outlined,
+                'Shapes and notes',
+                'Drag out a line, arrow, rectangle or ellipse. Tap to pin '
+                    'a note; tap the note later to read it.',
+              ),
+              item(
+                Icons.auto_fix_normal_outlined,
+                'Eraser',
+                'Tap a highlight, underline, strikethrough or note to '
+                    'remove it. Pen strokes, marker and shapes are painted '
+                    'into the page when applied; use Undo for those.',
               ),
               item(
                 Icons.check_circle_outline_rounded,
@@ -1284,6 +1565,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   }
 
   Future<void> _convertToWord() async {
+    if (!await _flushViewer() || !mounted) return;
     final WordExport? export = await _runBusy(
       'Converting to Word',
       () => PdfTools.toWord(_currentFile, _doc.name),
@@ -1471,8 +1753,218 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     }
   }
 
+  /// Applies a document-wide stamp as one history entry.
+  Future<void> _stamp(
+    String label,
+    String done,
+    Future<Uint8List> Function(Uint8List bytes, Uint8List font) render,
+  ) async {
+    setState(() {
+      _isLoading = true;
+      _busyLabel = label;
+    });
+    final Uint8List font = (await DocumentImport.loadFonts()).regular;
+    final PdfEditResult result = await PdfService.edit(
+      _currentFile,
+      label.toLowerCase(),
+      (bytes) => render(bytes, font),
+    );
+    if (!mounted) return;
+    _handleResult(result, done, undoable: !_editMode);
+  }
+
+  Future<void> _addWatermark() async {
+    final int count = await _knownPageCount();
+    if (count == 0 || !mounted) return;
+    final WatermarkOptions? options = await WatermarkSheet.show(
+      context,
+      pageCount: count,
+      currentPage: _currentPage.clamp(1, count),
+    );
+    if (options == null || !mounted) return;
+    await _stamp(
+      'Adding watermark',
+      'Watermark added',
+      (bytes, font) => PdfStamps.renderWatermark(bytes, options, font),
+    );
+  }
+
+  Future<void> _addPageNumbers() async {
+    final int count = await _knownPageCount();
+    if (count == 0 || !mounted) return;
+    final PageNumberOptions? options = await PageNumbersSheet.show(
+      context,
+      pageCount: count,
+      currentPage: _currentPage.clamp(1, count),
+    );
+    if (options == null || !mounted) return;
+    await _stamp(
+      'Adding page numbers',
+      'Page numbers added',
+      (bytes, font) => PdfStamps.renderPageNumbers(bytes, options, font),
+    );
+  }
+
+  Future<void> _flatten() async {
+    final (int, int)? found = await _runBusy(
+      'Reading',
+      () async => PdfStamps.countInteractive(await _currentFile.readAsBytes()),
+    );
+    if (found == null || !mounted) return;
+    final (int annotations, int fields) = found;
+    if (annotations == 0 && fields == 0) {
+      _showMessage('Nothing to flatten: no annotations or form fields.');
+      return;
+    }
+    final List<String> parts = [
+      if (annotations > 0)
+        '$annotations annotation${annotations == 1 ? '' : 's'}',
+      if (fields > 0) '$fields form field${fields == 1 ? '' : 's'}',
+    ];
+    final bool? go = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Flatten this document?'),
+        content: Text(
+          '${parts.join(' and ')} will become part of the page${annotations + fields == 1 ? '' : 's'}: '
+          'they look the same in every reader and can no longer be edited, '
+          'erased or filled in. Links are flattened too.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Flatten'),
+          ),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    await _stamp(
+      'Flattening',
+      'Flattened',
+      (bytes, _) => PdfStamps.renderFlatten(bytes),
+    );
+  }
+
+  /// Sets or removes the password the document is saved with.
+  Future<void> _protect() async {
+    final SnackBarAction save = SnackBarAction(
+      label: 'Save',
+      onPressed: _savePdf,
+    );
+    if (_password != null) {
+      final bool? remove = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Remove the password?'),
+          content: const Text(
+            'Once saved, anyone will be able to open this document.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Remove'),
+            ),
+          ],
+        ),
+      );
+      if (remove != true || !mounted) return;
+      setState(() {
+        _password = null;
+        _securityChanged = true;
+      });
+      _showMessage('Password removed. Save to apply.', action: save);
+      return;
+    }
+    final String? password = await ProtectSheet.show(context);
+    if (password == null || !mounted) return;
+    setState(() {
+      _password = password;
+      _securityChanged = true;
+    });
+    _showMessage('Password set. Save to apply.', action: save);
+  }
+
+  Future<void> _recogniseText() async {
+    if (!OcrService.isAvailable) {
+      _showMessage('Text recognition needs Android.');
+      return;
+    }
+    final bool? go = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Recognise text?'),
+        content: const Text(
+          'Scanned pages are read on this device and get an invisible text '
+          'layer, so they can be searched, selected and copied. Pages that '
+          'already have text are left alone.\n\n'
+          'Works for the Latin alphabet.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Recognise'),
+          ),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    final OcrOutcome? outcome = await _runBusy(
+      'Recognising text',
+      () => OcrService.makeSearchable(
+        _currentFile,
+        onProgress: (done, total) {
+          if (!mounted || total == 0) return;
+          setState(
+            () => _busyLabel =
+                'Recognising text, page ${(done + 1).clamp(1, total)} '
+                'of $total',
+          );
+        },
+      ),
+    );
+    if (outcome == null || !mounted) return;
+    final Uint8List? bytes = outcome.bytes;
+    if (bytes == null) {
+      _showMessage(
+        outcome.textPages == outcome.pageCount
+            ? 'Every page already has text.'
+            : 'No text could be recognised.',
+      );
+      return;
+    }
+    final Directory directory = await getApplicationDocumentsDirectory();
+    final File file = File(
+      '${directory.path}/edited_${DateTime.now().microsecondsSinceEpoch}.pdf',
+    );
+    await file.writeAsBytes(bytes, flush: true);
+    if (!mounted) return;
+    _handleResult(
+      PdfEditResult.success(file),
+      'Recognised text on ${outcome.recognisedPages} '
+      'page${outcome.recognisedPages == 1 ? '' : 's'}',
+      undoable: true,
+    );
+  }
+
   Future<void> _showTools() async {
-    final ToolAction? action = await ToolsSheet.show(context);
+    if (!await _flushViewer() || !mounted) return;
+    final ToolAction? action = await ToolsSheet.show(
+      context,
+      isProtected: _password != null,
+    );
     if (action == null || !mounted) return;
     switch (action) {
       case ToolAction.managePages:
@@ -1493,6 +1985,22 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         await _split();
       case ToolAction.merge:
         await _merge();
+      case ToolAction.watermark:
+        await _addWatermark();
+      case ToolAction.pageNumbers:
+        await _addPageNumbers();
+      case ToolAction.flatten:
+        await _flatten();
+      case ToolAction.protect:
+        await _protect();
+      case ToolAction.extractText:
+        await TextExtractScreen.open(
+          context,
+          file: _currentFile,
+          documentName: _doc.name,
+        );
+      case ToolAction.ocr:
+        await _recogniseText();
       case ToolAction.editText:
         await _enterEditMode(EditTab.edit, tool: EditTool.editText);
       case ToolAction.addText:
@@ -1508,6 +2016,14 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         await _enterEditMode(EditTab.annotate, tool: EditTool.strikethrough);
       case ToolAction.draw:
         await _enterEditMode(EditTab.annotate, tool: EditTool.draw);
+      case ToolAction.marker:
+        await _enterEditMode(EditTab.annotate, tool: EditTool.marker);
+      case ToolAction.shapes:
+        await _enterEditMode(EditTab.annotate, tool: EditTool.shape);
+      case ToolAction.note:
+        await _enterEditMode(EditTab.annotate, tool: EditTool.note);
+      case ToolAction.eraser:
+        await _enterEditMode(EditTab.annotate, tool: EditTool.eraser);
       case ToolAction.signature:
         await _enterEditMode(EditTab.sign);
         await _openSignatures();
@@ -1515,6 +2031,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
   }
 
   Future<void> _showFileOptions() async {
+    if (!await _flushViewer() || !mounted) return;
     final FileAction? action = await FileOptionsSheet.show(
       context,
       document: _doc,
@@ -1563,7 +2080,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           _doc = renamed;
         });
       case FileAction.share:
-        await DocumentActions.share(context, _currentFile, _doc.name);
+        // Shared as it would be saved: a protected document stays protected.
+        final File? outgoing = await _runBusy('Preparing', _fileToWrite);
+        if (outgoing == null || !mounted) return;
+        await DocumentActions.share(context, outgoing, _doc.name);
       case FileAction.print:
         await DocumentActions.printFile(context, _currentFile, _doc.name);
       case FileAction.favorite:
@@ -1598,7 +2118,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     }
   }
 
-  Future<void> _showViewSettings() {
+  Future<void> _showViewSettings() async {
+    // A change of layout recreates the viewer.
+    if (!await _flushViewer() || !mounted) return;
     return ViewSettingsSheet.show(
       context,
       settings: _settings,
@@ -1682,6 +2204,8 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
   Future<void> _changeTool(EditTool newTool) async {
     if (_activeTool == newTool) newTool = EditTool.none;
+    // Every tool reads the file, not the viewer.
+    if (!await _flushViewer() || !mounted) return;
 
     // Flush anything drawn with the tool being left behind. If the flush
     // fails the work is still pending, and switching away would hide its
@@ -1689,7 +2213,9 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     // so stay on the tool and let the user retry or redraw. Markup tools
     // share one batch, each item keeping its own kind, so moving between
     // them does not flush.
-    if (_activeTool == EditTool.draw && _pendingDrawStrokes.isNotEmpty) {
+    if (_isPen(_activeTool) &&
+        !_isPen(newTool) &&
+        _pendingDrawStrokes.isNotEmpty) {
       await _commitPendingDrawStrokes();
       if (_pendingDrawStrokes.isNotEmpty) return;
     } else if (_isMarkup(_activeTool) &&
@@ -1719,6 +2245,211 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     });
     _syncOverlayTicker();
     if (newTool == EditTool.editText) _loadTextBoxes();
+    if (newTool == EditTool.eraser) _loadMarks();
+  }
+
+  // --- Notes and the eraser --------------------------------------------------
+
+  Future<void> _addNoteAt(int pageIndex, Offset pagePoint) async {
+    final String? text = await askNoteText(context);
+    if (text == null || text.trim().isEmpty || !mounted) return;
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await PdfAnnotations.addNote(
+      _currentFile,
+      pageIndex,
+      pagePoint,
+      text,
+    );
+    if (!mounted) return;
+    _handleResult(result, 'Note added');
+  }
+
+  Future<void> _loadMarks() async {
+    final File file = _currentFile;
+    if (_marksPath == file.path || _loadingMarks) return;
+    setState(() => _loadingMarks = true);
+    List<PdfMark> marks = const [];
+    try {
+      marks = await PdfAnnotations.list(await file.readAsBytes());
+    } catch (e) {
+      _showMessage('Could not read the annotations: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loadingMarks = false;
+          _marks = marks;
+          _marksPath = file.path;
+        });
+        // The document changed while this was running; catch up.
+        if (_activeTool == EditTool.eraser && file.path != _currentFile.path) {
+          _loadMarks();
+        }
+      }
+    }
+  }
+
+  /// Where [mark] shows on its page as displayed.
+  Rect _markDisplayRect(PdfMark mark) {
+    // The viewer draws a note's icon from the corner of its box, larger.
+    final Rect bounds = mark.type == MarkType.note
+        ? mark.bounds.topLeft & PdfAnnotations.noteIconSize
+        : mark.bounds;
+    if (mark.pageIndex >= _pageTurns.length) return bounds;
+    return rotatePageRect(
+      bounds,
+      _unrotatedPageSizes[mark.pageIndex],
+      _pageTurns[mark.pageIndex],
+    );
+  }
+
+  Future<void> _onEraserTap(TapUpDetails details) async {
+    if (_loadingMarks || _marksPath != _currentFile.path) return;
+    final PdfPageGeometry? geometry = _geometry;
+    if (geometry == null) return;
+    final PdfPagePoint hit = geometry.resolve(details.localPosition);
+    PdfMark? best;
+    double bestArea = double.infinity;
+    for (final PdfMark mark in _marks) {
+      if (mark.pageIndex != hit.pageIndex) continue;
+      final Rect rect = _markDisplayRect(mark);
+      if (!rect.inflate(6).contains(hit.pagePoint)) continue;
+      // The smallest one under the finger: a note on top of a highlight is
+      // the thing being pointed at.
+      final double area = rect.width * rect.height;
+      if (area < bestArea) {
+        best = mark;
+        bestArea = area;
+      }
+    }
+    if (best == null) return;
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await PdfAnnotations.remove(
+      _currentFile,
+      best,
+    );
+    if (!mounted) return;
+    _handleResult(result, '${best.type.label} removed');
+  }
+
+  // --- Selected text ---------------------------------------------------------
+
+  void _onTextSelectionChanged(PdfTextSelectionChangedDetails details) {
+    final String? text = details.selectedText;
+    final Rect? region = details.globalSelectedRegion;
+    if (!mounted || (text == _selectedText && region == _selectionRegion)) {
+      return;
+    }
+    void apply() {
+      if (!mounted) return;
+      setState(() {
+        _selectedText = text;
+        _selectionRegion = region;
+      });
+    }
+
+    // A viewer being disposed reports its selection gone from inside the
+    // frame, where nothing may be rebuilt.
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => apply());
+    } else {
+      apply();
+    }
+  }
+
+  /// Drops the selection and returns what it held.
+  String _takeSelection() {
+    final String text = _selectedText ?? '';
+    _pdfViewerController.clearSelection();
+    setState(() {
+      _selectedText = null;
+      _selectionRegion = null;
+    });
+    return text;
+  }
+
+  Future<void> _copySelection() async {
+    await Clipboard.setData(ClipboardData(text: _takeSelection()));
+    _showMessage('Copied');
+  }
+
+  Future<void> _shareSelection() async {
+    final String text = _takeSelection();
+    try {
+      await SharePlus.instance.share(ShareParams(text: text));
+    } catch (e) {
+      _showMessage('Could not share: $e');
+    }
+  }
+
+  void _findSelection() {
+    final String query = _takeSelection()
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (query.isEmpty) return;
+    _searchController.text = query;
+    _startSearch();
+    _runSearch(query);
+  }
+
+  Future<void> _sendSelection({required bool translate}) async {
+    final String text = _takeSelection();
+    try {
+      if (translate) {
+        await DocumentService.translate(text);
+      } else {
+        await DocumentService.webSearch(text);
+      }
+    } on PlatformException catch (e) {
+      _showMessage(
+        e.message ??
+            (translate
+                ? 'No app here can translate text.'
+                : 'No app here can search the web.'),
+      );
+    }
+  }
+
+  /// Marks up exactly the selected text, line by line.
+  Future<void> _markSelection(MarkupKind kind) async {
+    final List<viewer.PdfTextLine> lines =
+        _pdfViewerKey.currentState?.getSelectedTextLines() ?? const [];
+    if (lines.isEmpty) return;
+    final Map<int, List<HighlightRect>> byPage = {};
+    for (final viewer.PdfTextLine line in lines) {
+      // Page numbers are 1-based here; bounds are in the page's own space,
+      // which is the space markup is written in.
+      byPage
+          .putIfAbsent(line.pageNumber - 1, () => [])
+          .add(
+            HighlightRect(
+              bounds: line.bounds,
+              color: _markupColors[kind]!,
+              kind: kind,
+            ),
+          );
+    }
+    _takeSelection();
+    if (!await _flushViewer() || !mounted) return;
+    setState(() => _isLoading = true);
+    final PdfEditResult result = await _applyPerPage(
+      byPage.keys,
+      (file, pageIndex) => PdfService.addHighlightAnnotation(
+        file,
+        pageIndex,
+        byPage[pageIndex]!,
+      ),
+    );
+    if (!mounted) return;
+    _handleResult(
+      result,
+      switch (kind) {
+        MarkupKind.highlight => 'Highlighted',
+        MarkupKind.underline => 'Underlined',
+        MarkupKind.strikethrough => 'Struck through',
+      },
+      undoable: !_editMode,
+    );
   }
 
   void _onDrawEnd() {
@@ -1740,7 +2471,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         .toList(growable: false);
 
     setState(() {
-      if (_activeTool == EditTool.draw) {
+      if (_isPen(_activeTool)) {
         // Resolve against the page under the first point so a stroke that
         // strays over a page boundary stays whole.
         final int pageIndex = geometry.resolve(screenPoints.first).pageIndex;
@@ -1758,13 +2489,21 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
             })
             .toList(growable: false);
 
+        final bool shape = _activeTool == EditTool.shape;
         _pendingDrawStrokes.add(
           _PendingStroke(
-            scenePoints: scenePoints,
-            pagePoints: pagePoints,
+            // A shape is its two ends; the wobble between them is not kept.
+            scenePoints: shape
+                ? [scenePoints.first, scenePoints.last]
+                : scenePoints,
+            pagePoints: shape
+                ? [pagePoints.first, pagePoints.last]
+                : pagePoints,
             pageIndex: pageIndex,
-            color: _selectedDrawColor,
-            width: _selectedDrawWidth,
+            color: _penColor,
+            width: _penWidth,
+            opacity: _penOpacity,
+            shape: shape ? _shapeKind : null,
           ),
         );
       } else if (_isMarkup(_activeTool)) {
@@ -1835,7 +2574,31 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
 
   // --- Build -----------------------------------------------------------------
 
+  /// Set while the viewer's own second pop, after Back cleared a selection,
+  /// is still on its way.
+  bool _swallowPop = false;
+
   Future<void> _onBack() async {
+    // The viewer parks an entry on this route while text is selected, and
+    // takes it off again by popping the navigator. With canPop false that
+    // pop lands here, where it is not the user asking to leave.
+    if (ModalRoute.of(context)?.willHandlePopInternally ?? false) {
+      // Still selected means Back was pressed, rather than the selection
+      // being tapped away; the viewer then pops a second time on its own.
+      _swallowPop = (_selectedText ?? '').isNotEmpty;
+      Navigator.of(context).pop();
+      if (_swallowPop) {
+        Future<void>.delayed(
+          const Duration(milliseconds: 400),
+          () => _swallowPop = false,
+        );
+      }
+      return;
+    }
+    if (_swallowPop) {
+      _swallowPop = false;
+      return;
+    }
     if (_placement != null) {
       setState(() => _placement = null);
       return;
@@ -1913,8 +2676,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         initialPage: _currentPage,
       );
     }
-    final bool isDrawingTool =
-        _activeTool == EditTool.draw || _isMarkup(_activeTool);
+    final bool isDrawingTool = _isPen(_activeTool) || _isMarkup(_activeTool);
     // Tints would also tint the live annotation colours, which draw on top
     // of the page unfiltered, so editing shows the page as it is.
     final PageTheme pageTheme = _editMode
@@ -1928,6 +2690,7 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         _viewportWidth = constraints.maxWidth;
         _viewportHeight = constraints.maxHeight;
         return Stack(
+          key: _viewportKey,
           children: [
             ColorFiltered(
               colorFilter: pageTheme.filter,
@@ -1963,12 +2726,23 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
                       setState(() => _currentPage = details.newPageNumber);
                     }
                   },
-                  onTap: _isTextTool ? _onViewerTap : null,
+                  onTap: _isTextTool || _activeTool == EditTool.note
+                      ? _onViewerTap
+                      : null,
+                  // The built-in menu only copies; ours also marks up.
+                  canShowTextSelectionMenu: false,
+                  onTextSelectionChanged: _onTextSelectionChanged,
+                  onFormFieldValueChanged: (_) => _markViewerDirty(),
+                  onAnnotationEdited: (_) => _markViewerDirty(),
+                  onAnnotationRemoved: (_) => _markViewerDirty(),
                 ),
               ),
             ),
             if (isDrawingTool) _buildDrawingOverlay(),
             if (_activeTool == EditTool.editText) _buildEditTextOverlay(),
+            if (_activeTool == EditTool.eraser) _buildEraserOverlay(),
+            if ((_selectedText ?? '').trim().isNotEmpty && !isDrawingTool)
+              _buildSelectionBar(theme),
             if (_placement != null)
               PlacementBox(
                 rect: _placement!.rect,
@@ -2030,7 +2804,15 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
       _runSearch(_searchQuery);
     }
     if (_activeTool == EditTool.editText) _loadTextBoxes();
+    if (_activeTool == EditTool.eraser) _loadMarks();
+    if (!_formHintShown && PdfStamps.hasFormFields(details.document)) {
+      _formHintShown = true;
+      _showMessage('This PDF has a form. Tap a field to fill it in.');
+    }
   }
+
+  /// Said once per document, not after every edit reloads it.
+  bool _formHintShown = false;
 
   void _onViewerTap(PdfGestureDetails details) {
     // pageNumber is 1-based, and is -1 when the tap landed outside every page.
@@ -2038,6 +2820,10 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
     // page late and failed outright on the last page.
     if (details.pageNumber < 1) return;
     final int pageIndex = details.pageNumber - 1;
+    if (_activeTool == EditTool.note) {
+      _addNoteAt(pageIndex, _toPdfSpace(pageIndex, details.pagePosition));
+      return;
+    }
     setState(() {
       // pagePosition is reported in displayed page space, so it needs the same
       // unrotation as gesture-drawn annotations.
@@ -2206,12 +2992,14 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
             painter: _DrawingPainter(
               points: _currentDrawing,
               tool: _activeTool,
-              drawColor: _selectedDrawColor,
-              drawWidth: _selectedDrawWidth,
+              drawColor: _penColor.withValues(alpha: _penOpacity),
+              drawWidth: _penWidth,
+              shapeKind: _shapeKind,
               markupColor: _markupColors[_markupKindOf(_activeTool)]!,
               strokes: _pendingDrawStrokes,
               highlights: _pendingHighlights,
               controller: _pdfViewerController,
+              topInset: () => _geometry?.topInset ?? 0,
               repaint: _overlayTick,
             ),
           ),
@@ -2230,12 +3018,97 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
         child: CustomPaint(
           size: Size.infinite,
           painter: _TextBoxPainter(
-            boxes: _textBoxesPath == _currentFile.path ? _textBoxes : const [],
+            boxes: _textBoxesPath == _currentFile.path
+                ? [for (final _TextBox b in _textBoxes) (b.pageIndex, b.displayRect)]
+                : const [],
             pageSizes: _pageSizes,
             viewportWidth: _viewportWidth,
             controller: _pdfViewerController,
             color: Theme.of(context).colorScheme.primary,
             repaint: _overlayTick,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEraserOverlay() {
+    // As the edit-text overlay: taps come here, drags reach the viewer.
+    return Positioned.fill(
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTapUp: _onEraserTap,
+        child: CustomPaint(
+          size: Size.infinite,
+          painter: _TextBoxPainter(
+            boxes: _marksPath == _currentFile.path
+                ? [
+                    for (final PdfMark mark in _marks)
+                      (mark.pageIndex, _markDisplayRect(mark)),
+                  ]
+                : const [],
+            pageSizes: _pageSizes,
+            viewportWidth: _viewportWidth,
+            controller: _pdfViewerController,
+            color: Theme.of(context).colorScheme.error,
+            repaint: _overlayTick,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// What can be done with the selected text, floating by the selection.
+  Widget _buildSelectionBar(ThemeData theme) {
+    const double height = 48;
+    double top = 12;
+    final Rect? region = _selectionRegion;
+    final RenderObject? box = _viewportKey.currentContext?.findRenderObject();
+    if (region != null && box is RenderBox) {
+      // Above the selection where there is room, below it otherwise.
+      top = box.globalToLocal(region.topCenter).dy - height - 16;
+      if (top < 8) top = box.globalToLocal(region.bottomCenter).dy + 32;
+      top = top.clamp(8.0, math.max(8.0, _viewportHeight - height - 8));
+    }
+    Widget action(String label, VoidCallback onPressed) => TextButton(
+      onPressed: _isLoading ? null : onPressed,
+      style: TextButton.styleFrom(
+        minimumSize: const Size(48, height),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+      ),
+      child: Text(label),
+    );
+    return Positioned(
+      top: top,
+      left: 8,
+      right: 8,
+      child: Center(
+        child: Material(
+          elevation: 6,
+          color: theme.colorScheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(height / 2),
+          clipBehavior: Clip.antiAlias,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                action('Copy', _copySelection),
+                action('Highlight', () => _markSelection(MarkupKind.highlight)),
+                action('Underline', () => _markSelection(MarkupKind.underline)),
+                action(
+                  'Strike',
+                  () => _markSelection(MarkupKind.strikethrough),
+                ),
+                if (!_editMode) action('Find', _findSelection),
+                action('Share', _shareSelection),
+                if (DocumentService.supportsSaf) ...[
+                  action('Translate', () => _sendSelection(translate: true)),
+                  action('Web search', () => _sendSelection(translate: false)),
+                ],
+              ],
+            ),
           ),
         ),
       ),
@@ -2400,6 +3273,30 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           () => _changeTool(EditTool.draw),
           active: _activeTool == EditTool.draw,
         ),
+        _buildEditTool(
+          Icons.brush_outlined,
+          'Marker',
+          () => _changeTool(EditTool.marker),
+          active: _activeTool == EditTool.marker,
+        ),
+        _buildEditTool(
+          Icons.category_outlined,
+          'Shapes',
+          () => _changeTool(EditTool.shape),
+          active: _activeTool == EditTool.shape,
+        ),
+        _buildEditTool(
+          Icons.sticky_note_2_outlined,
+          'Note',
+          () => _changeTool(EditTool.note),
+          active: _activeTool == EditTool.note,
+        ),
+        _buildEditTool(
+          Icons.auto_fix_normal_outlined,
+          'Eraser',
+          () => _changeTool(EditTool.eraser),
+          active: _activeTool == EditTool.eraser,
+        ),
       ],
       EditTab.sign => [
         _buildEditTool(
@@ -2427,9 +3324,19 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
           children: [
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 6),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: tools,
+              // The annotate tab holds more tools than a phone is wide, so
+              // the row scrolls; the others still spread across it.
+              child: LayoutBuilder(
+                builder: (context, constraints) => SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: tools,
+                    ),
+                  ),
+                ),
               ),
             ),
             Divider(height: 1, color: colors.outlineVariant),
@@ -2693,6 +3600,146 @@ class _PdfEditorScreenState extends State<PdfEditorScreen>
               onUndo: () => _discardLastPending(_pendingDrawStrokes),
               onDiscardAll: () => _discardAllPending(_pendingDrawStrokes),
               onApply: _commitPendingDrawStrokes,
+            ),
+          ],
+        );
+      case EditTool.marker:
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final MapEntry<String, double> size
+                      in _markerWidths.entries)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: ChoiceChip(
+                        label: Text(size.key),
+                        selected: _markerWidth == size.value,
+                        onSelected: (_) =>
+                            setState(() => _markerWidth = size.value),
+                      ),
+                    ),
+                  const SizedBox(width: 6),
+                  for (final Color color in const [
+                    Colors.yellow,
+                    Colors.greenAccent,
+                    Colors.lightBlueAccent,
+                    Colors.pinkAccent,
+                    Colors.orangeAccent,
+                  ])
+                    _buildColorPicker(
+                      color,
+                      (c) => setState(() => _markerColor = c),
+                      _markerColor,
+                    ),
+                ],
+              ),
+            ),
+            _buildPendingActions(
+              theme,
+              hasPending: _pendingDrawStrokes.isNotEmpty,
+              onUndo: () => _discardLastPending(_pendingDrawStrokes),
+              onDiscardAll: () => _discardAllPending(_pendingDrawStrokes),
+              onApply: _commitPendingDrawStrokes,
+            ),
+          ],
+        );
+      case EditTool.shape:
+        const Map<ShapeKind, (IconData, String)> kinds = {
+          ShapeKind.rectangle: (Icons.crop_square_rounded, 'Rectangle'),
+          ShapeKind.ellipse: (Icons.circle_outlined, 'Ellipse'),
+          ShapeKind.line: (Icons.horizontal_rule_rounded, 'Line'),
+          ShapeKind.arrow: (Icons.north_east_rounded, 'Arrow'),
+        };
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final MapEntry<ShapeKind, (IconData, String)> kind
+                      in kinds.entries)
+                    IconButton(
+                      icon: Icon(kind.value.$1),
+                      tooltip: kind.value.$2,
+                      isSelected: _shapeKind == kind.key,
+                      style: IconButton.styleFrom(
+                        backgroundColor: _shapeKind == kind.key
+                            ? theme.colorScheme.secondaryContainer
+                            : null,
+                      ),
+                      onPressed: () => setState(() => _shapeKind = kind.key),
+                    ),
+                  const SizedBox(width: 8),
+                  for (final Color color in const [
+                    Colors.red,
+                    Colors.blue,
+                    Colors.green,
+                    Colors.black,
+                  ])
+                    _buildColorPicker(
+                      color,
+                      (c) => setState(() => _shapeColor = c),
+                      _shapeColor,
+                    ),
+                ],
+              ),
+            ),
+            Row(
+              children: [
+                const Text('Width:'),
+                Expanded(
+                  child: Slider(
+                    value: _shapeWidth,
+                    min: 1.0,
+                    max: 12.0,
+                    divisions: 11,
+                    label: _shapeWidth.round().toString(),
+                    onChanged: (val) => setState(() => _shapeWidth = val),
+                  ),
+                ),
+              ],
+            ),
+            _buildPendingActions(
+              theme,
+              hasPending: _pendingDrawStrokes.isNotEmpty,
+              onUndo: () => _discardLastPending(_pendingDrawStrokes),
+              onDiscardAll: () => _discardAllPending(_pendingDrawStrokes),
+              onApply: _commitPendingDrawStrokes,
+            ),
+          ],
+        );
+      case EditTool.note:
+        return Text(
+          'Tap where the note should go',
+          style: theme.textTheme.bodyMedium,
+        );
+      case EditTool.eraser:
+        final bool ready = !_loadingMarks && _marksPath == _currentFile.path;
+        return Row(
+          children: [
+            if (!ready) ...[
+              const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 12),
+            ],
+            Expanded(
+              child: Text(
+                !ready
+                    ? 'Finding annotations…'
+                    : _marks.isEmpty
+                    ? 'Nothing to erase here. Pen strokes and shapes are '
+                          'part of the page once applied; use Undo for those.'
+                    : 'Tap a boxed highlight or note to remove it',
+                style: theme.textTheme.bodyMedium,
+              ),
             ),
           ],
         );
@@ -3020,6 +4067,7 @@ class _DrawingPainter extends CustomPainter {
   final EditTool tool;
   final Color drawColor;
   final double drawWidth;
+  final ShapeKind shapeKind;
   final Color markupColor;
   final List<_PendingStroke> strokes;
   final List<_PendingHighlight> highlights;
@@ -3031,22 +4079,28 @@ class _DrawingPainter extends CustomPainter {
   /// otherwise the preview slides off the page as soon as the user pans.
   final PdfViewerController controller;
 
+  /// How far the viewer has pushed a short document down to centre it, in
+  /// scene units; read at paint time for the same reason.
+  final double Function() topInset;
+
   _DrawingPainter({
     required this.points,
     required this.tool,
     required this.drawColor,
     required this.drawWidth,
+    required this.shapeKind,
     required this.markupColor,
     required this.strokes,
     required this.highlights,
     required this.controller,
+    required this.topInset,
     required Listenable repaint,
   }) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
     final double zoom = controller.zoomLevel;
-    final Offset scroll = controller.scrollOffset;
+    final Offset scroll = controller.scrollOffset - Offset(0, topInset());
     Offset toScreen(Offset scene) => (scene - scroll) * zoom;
 
     for (final h in highlights) {
@@ -3063,20 +4117,34 @@ class _DrawingPainter extends CustomPainter {
     }
 
     for (final stroke in strokes) {
-      _drawPolyline(
-        canvas,
-        stroke.scenePoints.map(toScreen).toList(growable: false),
-        stroke.color,
-        // Zoom the preview's thickness too, or a stroke drawn zoomed in
-        // visibly changes weight the moment it is committed.
-        stroke.width * zoom,
-      );
+      final List<Offset> screen = stroke.scenePoints
+          .map(toScreen)
+          .toList(growable: false);
+      final Color color = stroke.color.withValues(alpha: stroke.opacity);
+      // Zoom the preview's thickness too, or a stroke drawn zoomed in
+      // visibly changes weight the moment it is committed.
+      final double width = stroke.width * zoom;
+      final ShapeKind? shape = stroke.shape;
+      if (shape != null) {
+        _drawShape(canvas, shape, screen.first, screen.last, color, width);
+      } else {
+        _drawPolyline(canvas, screen, color, width);
+      }
     }
 
     if (points.isEmpty) return;
 
-    if (tool == EditTool.draw) {
+    if (tool == EditTool.draw || tool == EditTool.marker) {
       _drawPolyline(canvas, points, drawColor, drawWidth);
+    } else if (tool == EditTool.shape) {
+      _drawShape(
+        canvas,
+        shapeKind,
+        points.first,
+        points.last,
+        drawColor,
+        drawWidth,
+      );
     } else if (_PdfEditorScreenState._isMarkup(tool)) {
       final Rect bounds = _PdfEditorScreenState._boundsOf(points);
       final MarkupKind kind = _PdfEditorScreenState._markupKindOf(tool);
@@ -3118,6 +4186,51 @@ class _DrawingPainter extends CustomPainter {
     }
   }
 
+  static void _drawShape(
+    Canvas canvas,
+    ShapeKind kind,
+    Offset from,
+    Offset to,
+    Color color,
+    double width,
+  ) {
+    final Paint paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..color = color
+      ..strokeWidth = width;
+    switch (kind) {
+      case ShapeKind.rectangle:
+        canvas.drawRect(Rect.fromPoints(from, to), paint);
+      case ShapeKind.ellipse:
+        canvas.drawOval(Rect.fromPoints(from, to), paint);
+      case ShapeKind.line:
+        canvas.drawLine(from, to, paint);
+      case ShapeKind.arrow:
+        canvas.drawLine(from, to, paint);
+        final double length = (to - from).distance;
+        if (length < 1) return;
+        final Offset along = (to - from) / length;
+        final Offset across = Offset(-along.dy, along.dx);
+        final double head = math.max(9, width * 4);
+        final Offset base = to - along * head;
+        canvas.drawPath(
+          Path()
+            ..moveTo(to.dx, to.dy)
+            ..lineTo(
+              (base + across * head * 0.45).dx,
+              (base + across * head * 0.45).dy,
+            )
+            ..lineTo(
+              (base - across * head * 0.45).dx,
+              (base - across * head * 0.45).dy,
+            )
+            ..close(),
+          Paint()..color = color,
+        );
+    }
+  }
+
   static void _drawPolyline(
     Canvas canvas,
     List<Offset> points,
@@ -3153,10 +4266,12 @@ class _DrawingPainter extends CustomPainter {
   bool shouldRepaint(covariant _DrawingPainter oldDelegate) => true;
 }
 
-/// Dashed boxes around every editable line, projected through the viewer's
-/// live transform so they follow the page while it scrolls and zooms.
+/// Dashed boxes around every editable line or erasable annotation,
+/// projected through the viewer's live transform so they follow the page
+/// while it scrolls and zooms.
 class _TextBoxPainter extends CustomPainter {
-  final List<_TextBox> boxes;
+  /// Page index and rectangle in displayed page space.
+  final List<(int, Rect)> boxes;
   final List<Size> pageSizes;
   final double viewportWidth;
   final PdfViewerController controller;
@@ -3186,21 +4301,30 @@ class _TextBoxPainter extends CustomPainter {
       top += pageSizes[i].height * viewportWidth / pageSizes[i].width;
       top += kPageSpacing;
     }
+    // A document shorter than the viewer is centred in it.
+    final double inset = PdfPageGeometry.insetFor(
+      top - kPageSpacing,
+      size.height,
+      zoom,
+    );
+    for (int i = 0; i < tops.length; i++) {
+      tops[i] += inset;
+    }
 
     final Rect screen = Offset.zero & size;
     final Paint paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2;
-    for (final _TextBox box in boxes) {
-      if (box.pageIndex >= pageSizes.length) continue;
-      final double scale = viewportWidth / pageSizes[box.pageIndex].width;
-      final Rect r = box.displayRect.inflate(1.5);
+    for (final (int pageIndex, Rect displayRect) in boxes) {
+      if (pageIndex >= pageSizes.length) continue;
+      final double scale = viewportWidth / pageSizes[pageIndex].width;
+      final Rect r = displayRect.inflate(1.5);
       final Rect onScreen = Rect.fromLTRB(
         (r.left * scale - scroll.dx) * zoom,
-        (tops[box.pageIndex] + r.top * scale - scroll.dy) * zoom,
+        (tops[pageIndex] + r.top * scale - scroll.dy) * zoom,
         (r.right * scale - scroll.dx) * zoom,
-        (tops[box.pageIndex] + r.bottom * scale - scroll.dy) * zoom,
+        (tops[pageIndex] + r.bottom * scale - scroll.dy) * zoom,
       );
       if (!onScreen.overlaps(screen)) continue;
       _dashRect(canvas, onScreen, paint);

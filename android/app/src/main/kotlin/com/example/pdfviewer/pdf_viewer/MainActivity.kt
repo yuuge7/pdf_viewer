@@ -1,6 +1,7 @@
 package com.example.pdfviewer.pdf_viewer
 
 import android.app.Activity
+import android.app.SearchManager
 import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Context
@@ -19,6 +20,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.print.PageRange
+import android.print.PdfWriter
 import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
@@ -27,6 +29,8 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.WindowManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -152,7 +156,21 @@ class MainActivity : FlutterActivity() {
 
     private fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
-            "pickDocument" -> pickDocument(result)
+            "pickDocument" -> pickDocument(call.argument<List<String>>("mimes"), result)
+            "translateText" -> translate(call.argument<String>("text") ?: "", result)
+            "webSearch" -> launch(
+                Intent(Intent.ACTION_WEB_SEARCH)
+                    .putExtra(SearchManager.QUERY, call.argument<String>("text") ?: ""),
+                result
+            )
+            "htmlToPdf" -> htmlToPdf(
+                call.argument<String>("html") ?: "",
+                call.argument<String>("outPath")!!,
+                call.argument<Boolean>("landscape") ?: false,
+                call.argument<Boolean>("letter") ?: false,
+                call.argument<Boolean>("margins") ?: true,
+                result
+            )
             "pickDocuments" -> pickDocuments(result)
             "createDocument" -> createDocument(
                 call.argument<String>("name") ?: "document.pdf",
@@ -260,6 +278,133 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /**
+     * Hands [text] to a translation app. There is no translator in here:
+     * everything this app does stays on the device, and a translation model
+     * is not something it carries.
+     */
+    private fun translate(text: String, result: MethodChannel.Result) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                startActivity(Intent(Intent.ACTION_TRANSLATE).putExtra(Intent.EXTRA_TEXT, text))
+                result.success(null)
+                return
+            } catch (_: ActivityNotFoundException) {
+                // Fall through to the text processors.
+            }
+        }
+        // Translators also register as text processors, which is how the
+        // system's own selection menu reaches them.
+        val process = Intent(Intent.ACTION_PROCESS_TEXT).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_PROCESS_TEXT, text)
+            putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true)
+        }
+        launch(Intent.createChooser(process, "Translate with"), result)
+    }
+
+    // --- HTML to PDF ---------------------------------------------------------
+
+    /** Held while a conversion runs, so the WebView is not collected under it. */
+    private var printingWebView: WebView? = null
+
+    /**
+     * Lays [html] out on pages and writes them to [outPath].
+     *
+     * A WebView is the only HTML engine on the device, and its print adapter
+     * the only thing that paginates it. The network stays blocked: a page is
+     * rendered from what it carries, and nothing it references is fetched.
+     *
+     * On some WebView builds the adapter takes the page and never reports
+     * back, attached to a window or not. Hence the time limit; Dart falls
+     * back to its own layout when it trips.
+     */
+    private fun htmlToPdf(
+        html: String,
+        outPath: String,
+        landscape: Boolean,
+        letter: Boolean,
+        margins: Boolean,
+        result: MethodChannel.Result
+    ) {
+        if (printingWebView != null) {
+            result.error("busy", "Another page is still being converted.", null)
+            return
+        }
+        val webView = try {
+            WebView(applicationContext)
+        } catch (e: Exception) {
+            result.error("no_webview", "This device has no web view to render HTML with.", null)
+            return
+        }
+        printingWebView = webView
+        var finished = false
+        fun finish(error: Throwable?) {
+            if (finished) return
+            finished = true
+            main.post {
+                printingWebView = null
+                webView.destroy()
+                if (error == null) {
+                    result.success(outPath)
+                } else {
+                    result.error("failed", error.message ?: "Could not convert the page.", null)
+                }
+            }
+        }
+
+        // Scripts stay off: the page is laid out from what it is, not from
+        // what it would run.
+        webView.settings.javaScriptEnabled = false
+        webView.settings.blockNetworkLoads = true
+        webView.settings.allowFileAccess = false
+        // Nothing here may leave Dart waiting for ever.
+        main.postDelayed({ finish(RuntimeException("The page took too long to render.")) }, 15_000)
+        var started = false
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String?) {
+                // Reported more than once for some pages.
+                if (started) return
+                started = true
+                // A beat for fonts and embedded images to settle. Through the
+                // activity's handler: a view that is not attached to a window
+                // only queues what is posted to it, for an attach that never
+                // comes.
+                main.postDelayed({
+                    try {
+                        val base = if (letter) PrintAttributes.MediaSize.NA_LETTER
+                        else PrintAttributes.MediaSize.ISO_A4
+                        val attributes = PrintAttributes.Builder()
+                            .setMediaSize(if (landscape) base.asLandscape() else base.asPortrait())
+                            .setResolution(PrintAttributes.Resolution("pdf", "pdf", 600, 600))
+                            .setMinMargins(
+                                // Thousandths of an inch.
+                                if (margins) PrintAttributes.Margins(630, 700, 630, 700)
+                                else PrintAttributes.Margins.NO_MARGINS
+                            )
+                            .build()
+                        val out = ParcelFileDescriptor.open(
+                            File(outPath),
+                            ParcelFileDescriptor.MODE_CREATE or
+                                ParcelFileDescriptor.MODE_TRUNCATE or
+                                ParcelFileDescriptor.MODE_READ_WRITE
+                        )
+                        PdfWriter.write(view.createPrintDocumentAdapter("document"), attributes, out) { error ->
+                            try {
+                                out.close()
+                            } catch (_: Exception) {
+                            }
+                            finish(error)
+                        }
+                    } catch (e: Throwable) {
+                        finish(e)
+                    }
+                }, 350)
+            }
+        }
+        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+    }
+
     /** Runs [block] off the platform thread and replies on it. */
     private fun <T> onWorker(result: MethodChannel.Result, block: () -> T) {
         worker.execute {
@@ -278,7 +423,12 @@ class MainActivity : FlutterActivity() {
 
     // --- Picking -------------------------------------------------------------
 
-    private fun pickDocument(result: MethodChannel.Result) {
+    /**
+     * One document to open and keep. [mimes] widens the picker beyond PDFs,
+     * for the files that are converted or handed to another editor on the
+     * way in.
+     */
+    private fun pickDocument(mimes: List<String>?, result: MethodChannel.Result) {
         if (pendingResult != null) {
             result.error("busy", "Another document chooser is already open.", null)
             return
@@ -286,7 +436,12 @@ class MainActivity : FlutterActivity() {
         pendingResult = result
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/pdf"
+            if (mimes.isNullOrEmpty()) {
+                type = "application/pdf"
+            } else {
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, mimes.toTypedArray())
+            }
             addFlags(PERSISTABLE_FLAGS or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
         try {
@@ -479,12 +634,18 @@ class MainActivity : FlutterActivity() {
                 if (requestCode == REQUEST_CREATE && createSource != null) {
                     writeDocument(uri.toString(), createSource)
                 }
-                val cached = copyToCache(uri.toString())
+                val name = displayName(uri)
+                val cached = copyToCache(uri.toString(), cacheExtension(name))
                 val payload = mapOf(
                     "uri" to uri.toString(),
-                    "name" to displayName(uri),
+                    "name" to name,
                     "path" to cached,
-                    "canWrite" to canWrite(uri.toString())
+                    "canWrite" to canWrite(uri.toString()),
+                    "mime" to try {
+                        contentResolver.getType(uri)
+                    } catch (_: Exception) {
+                        null
+                    }
                 )
                 main.post { result.success(payload) }
             } catch (e: Exception) {
@@ -867,6 +1028,8 @@ class MainActivity : FlutterActivity() {
             "png" -> "image/png"
             "pdf" -> "application/pdf"
             "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "txt" -> "text/plain"
             else -> fallback
         }
 

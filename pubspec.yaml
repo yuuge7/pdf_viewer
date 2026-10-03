@@ -50,6 +50,7 @@ dependencies:
   # Reads the parts of a .docx opened from another app. Already resolved
   # through `image` as well.
   xml: ^7.0.1
+  google_mlkit_text_recognition: ^0.17.1
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 import 'screens/home_screen.dart';
+import 'services/app_settings.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Before the first frame, so a dark-mode user is not flashed a light one.
+  await AppSettings.load();
   runApp(const PdfViewerApp());
 }
 
@@ -10,33 +14,27 @@ class PdfViewerApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'ProPDF Studio',
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E3A8A), // Premium Deep Blue
-          brightness: Brightness.light,
-        ),
-        appBarTheme: const AppBarTheme(
-          centerTitle: true,
-          elevation: 0,
-        ),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: AppSettings.themeMode,
+      builder: (context, mode, _) => MaterialApp(
+        title: 'ProPDF Studio',
+        theme: _theme(Brightness.light),
+        darkTheme: _theme(Brightness.dark),
+        themeMode: mode,
+        home: const HomeScreen(),
+        debugShowCheckedModeBanner: false,
       ),
-      darkTheme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF1E3A8A),
-          brightness: Brightness.dark,
-        ),
-        appBarTheme: const AppBarTheme(
-          centerTitle: true,
-          elevation: 0,
-        ),
+    );
+  }
+
+  static ThemeData _theme(Brightness brightness) {
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: const Color(0xFF1E3A8A), // Premium Deep Blue
+        brightness: brightness,
       ),
-      themeMode: ThemeMode.system,
-      home: const HomeScreen(),
-      debugShowCheckedModeBanner: false,
+      appBarTheme: const AppBarTheme(centerTitle: true, elevation: 0),
     );
   }
 }

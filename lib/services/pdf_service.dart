@@ -18,10 +18,15 @@ class DrawStroke {
   final List<Offset> points;
   final Color color;
   final double width;
+
+  /// Below 1 the stroke is a highlighter: see-through, and darkening what
+  /// is under it rather than covering it.
+  final double opacity;
   const DrawStroke({
     required this.points,
     required this.color,
     required this.width,
+    this.opacity = 1,
   });
 }
 
@@ -293,6 +298,7 @@ class PdfService {
             g: _channel(s.color.g),
             b: _channel(s.color.b),
             width: s.width,
+            opacity: s.opacity,
           ),
         )
         .toList(growable: false);
@@ -321,7 +327,17 @@ class PdfService {
           for (int i = 0; i < simplified.length - 1; i++) {
             path.addLine(simplified[i], simplified[i + 1]);
           }
-          page.graphics.drawPath(path, pen: pen);
+          if (stroke.opacity < 1) {
+            page.graphics.save();
+            page.graphics.setTransparency(
+              stroke.opacity.clamp(0.05, 1.0),
+              mode: PdfBlendMode.multiply,
+            );
+            page.graphics.drawPath(path, pen: pen);
+            page.graphics.restore();
+          } else {
+            page.graphics.drawPath(path, pen: pen);
+          }
         }
         return Uint8List.fromList(await document.save());
       } finally {
@@ -773,7 +789,7 @@ class PdfService {
     Color color,
     double fontSize,
   ) {
-    return _edit(
+    return edit(
       file,
       'add text',
       (bytes) => renderTextAnnotation(
@@ -792,7 +808,7 @@ class PdfService {
     int pageIndex,
     List<HighlightRect> highlights,
   ) {
-    return _edit(
+    return edit(
       file,
       'highlight',
       (bytes) => renderHighlightAnnotation(bytes, pageIndex, highlights),
@@ -804,7 +820,7 @@ class PdfService {
     int pageIndex,
     List<DrawStroke> strokes,
   ) {
-    return _edit(
+    return edit(
       file,
       'draw',
       (bytes) => renderDrawAnnotation(bytes, pageIndex, strokes),
@@ -816,7 +832,7 @@ class PdfService {
     List<int> pageIndices,
     int quarterTurns,
   ) {
-    return _edit(
+    return edit(
       file,
       'rotate',
       (bytes) => renderRotatePages(bytes, pageIndices, quarterTurns),
@@ -824,7 +840,7 @@ class PdfService {
   }
 
   static Future<PdfEditResult> deletePages(File file, List<int> pageIndices) {
-    return _edit(
+    return edit(
       file,
       'delete pages',
       (bytes) => renderDeletePages(bytes, pageIndices),
@@ -832,7 +848,7 @@ class PdfService {
   }
 
   static Future<PdfEditResult> appendImages(File file, List<Uint8List> images) {
-    return _edit(
+    return edit(
       file,
       'add pages',
       (bytes) => renderAppendImages(bytes, images),
@@ -846,7 +862,7 @@ class PdfService {
     Rect bounds, {
     int counterTurns = 0,
   }) {
-    return _edit(
+    return edit(
       file,
       'add the image',
       (bytes) =>
@@ -865,7 +881,7 @@ class PdfService {
     bool italic = false,
     Color color = Colors.black,
   }) {
-    return _edit(
+    return edit(
       file,
       'edit the text',
       (bytes) => renderReplaceText(
@@ -884,7 +900,7 @@ class PdfService {
 
   /// Rebuilds [file] as [specs]; see [renderLayout].
   static Future<PdfEditResult> applyLayout(File file, List<PageSpec> specs) {
-    return _edit(file, 'rearrange pages', (bytes) async {
+    return edit(file, 'rearrange pages', (bytes) async {
       return renderLayout(bytes, specs, await readForeignSources(specs));
     });
   }
@@ -905,7 +921,7 @@ class PdfService {
 
   /// Reads [file], applies [render], and writes the result to a fresh file in
   /// the app documents directory. The source file is never modified.
-  static Future<PdfEditResult> _edit(
+  static Future<PdfEditResult> edit(
     File file,
     String operation,
     Future<Uint8List> Function(Uint8List bytes) render,
@@ -1338,11 +1354,13 @@ class _PlainStroke {
   final int g;
   final int b;
   final double width;
+  final double opacity;
   const _PlainStroke({
     required this.points,
     required this.r,
     required this.g,
     required this.b,
     required this.width,
+    required this.opacity,
   });
 }

@@ -284,4 +284,55 @@ void main() {
       expect(r.bounds.bottom, closeTo(842, 0.001));
     });
   });
+
+  group('a document shorter than the viewer', () {
+    // One landscape page, 400 wide on screen and 200 tall, in a viewer 600
+    // tall: the viewer centres it, 200 down.
+    PdfPageGeometry short({double zoom = 1}) => PdfPageGeometry(
+      pageSizes: const [Size(800, 400)],
+      viewportWidth: 400,
+      pageSpacing: 4,
+      zoom: zoom,
+      scrollOffset: Offset.zero,
+      viewportHeight: 600,
+    );
+
+    test('is taken to start where the viewer centres it', () {
+      final PdfPageGeometry g = short();
+      expect(g.sceneHeight, 200);
+      expect(g.topInset, 200);
+      // The top-left of the page on screen is its origin.
+      expect(g.resolve(const Offset(0, 200)).pagePoint, Offset.zero);
+      // The middle of the screen is the middle of the page.
+      expect(g.resolve(const Offset(200, 300)).pagePoint, const Offset(400, 200));
+      // Above the page clamps onto it rather than landing off it.
+      expect(g.resolve(const Offset(0, 50)).pagePoint.dy, 0);
+    });
+
+    test('goes there and back', () {
+      final PdfPageGeometry g = short(zoom: 1.5);
+      const Offset screen = Offset(120, 340);
+      final Offset back = g.toScreen(g.toScene(screen));
+      expect(back.dx, closeTo(screen.dx, 1e-9));
+      expect(back.dy, closeTo(screen.dy, 1e-9));
+      // Zoomed in it fills more of the viewer, so there is less to centre.
+      expect(g.topInset, closeTo(100, 1e-9));
+    });
+
+    test('a document that fills the viewer starts at its top', () {
+      expect(
+        PdfPageGeometry(
+          pageSizes: const [a4, a4],
+          viewportWidth: 595,
+          pageSpacing: 4,
+          zoom: 1,
+          scrollOffset: Offset.zero,
+          viewportHeight: 600,
+        ).topInset,
+        0,
+      );
+      // And one whose viewer height is not known behaves as before.
+      expect(geometryOf(pages: const [Size(800, 400)]).topInset, 0);
+    });
+  });
 }

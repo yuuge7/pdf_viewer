@@ -1,6 +1,12 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
+import '../services/pdf_service.dart' show PaperSize;
+import '../services/pdf_stamps.dart';
 import '../services/pdf_tools.dart';
+
+part 'stamp_sheets.dart';
 
 /// Shared frame for the option sheets: title, body, one primary action.
 class _OptionSheet extends StatelessWidget {

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../services/ocr_service.dart';
 import '../services/document_service.dart';
 import '../services/recent_documents.dart';
 import '../services/scan_service.dart';
@@ -100,6 +101,10 @@ class _ScanScreenState extends State<ScanScreen> {
   bool _isPicking = false;
   String? _status;
   ScanPageSize _pageSize = ScanPageSize.fitImage;
+
+  /// Whether the saved PDF gets a text layer, read off the pages on the
+  /// device, so that it can be searched and copied from.
+  bool _searchable = OcrService.isAvailable;
 
   @override
   void initState() {
@@ -397,6 +402,20 @@ class _ScanScreenState extends State<ScanScreen> {
         return;
       }
 
+      if (_searchable && OcrService.isAvailable) {
+        setState(() => _status = 'Recognising text');
+        try {
+          final OcrOutcome outcome = await OcrService.makeSearchable(built);
+          final Uint8List? searchable = outcome.bytes;
+          if (searchable != null) {
+            await built.writeAsBytes(searchable, flush: true);
+          }
+        } catch (_) {
+          // A scan nobody can search is still the scan that was asked for.
+        }
+        if (!mounted) return;
+      }
+
       if (!DocumentService.supportsSaf) {
         // No document picker to save through, so hand back the file as it
         // stands rather than pretending it was filed somewhere.
@@ -442,6 +461,7 @@ class _ScanScreenState extends State<ScanScreen> {
       text: 'Scan ${_timestamp()}.pdf',
     );
     ScanPageSize size = _pageSize;
+    bool searchable = _searchable;
 
     final String? name = await showDialog<String>(
       context: context,
@@ -474,6 +494,14 @@ class _ScanScreenState extends State<ScanScreen> {
                 onSelectionChanged: (selection) =>
                     setDialogState(() => size = selection.first),
               ),
+              if (OcrService.isAvailable)
+                SwitchListTile(
+                  contentPadding: const EdgeInsets.only(top: 8),
+                  value: searchable,
+                  onChanged: (on) => setDialogState(() => searchable = on),
+                  title: const Text('Searchable text'),
+                  subtitle: const Text('Read the pages so they can be searched'),
+                ),
             ],
           ),
           actions: [
@@ -493,7 +521,12 @@ class _ScanScreenState extends State<ScanScreen> {
 
     controller.dispose();
     if (name == null) return null;
-    if (mounted) setState(() => _pageSize = size);
+    if (mounted) {
+      setState(() {
+        _pageSize = size;
+        _searchable = searchable;
+      });
+    }
     if (name.isEmpty) return 'Scan ${_timestamp()}.pdf';
     return name.toLowerCase().endsWith('.pdf') ? name : '$name.pdf';
   }

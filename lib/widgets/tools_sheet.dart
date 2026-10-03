@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 enum ToolAction {
@@ -10,6 +12,12 @@ enum ToolAction {
   compress,
   split,
   merge,
+  watermark,
+  pageNumbers,
+  flatten,
+  protect,
+  extractText,
+  ocr,
   editText,
   addText,
   addImage,
@@ -17,6 +25,10 @@ enum ToolAction {
   underline,
   strikethrough,
   draw,
+  marker,
+  shapes,
+  note,
+  eraser,
   signature,
 }
 
@@ -32,13 +44,22 @@ class _Tool {
 class ToolsSheet extends StatelessWidget {
   final int initialTab;
 
-  const ToolsSheet({super.key, this.initialTab = 0});
+  /// Whether the open document asks for a password, which turns Protect
+  /// into the way to take it off again.
+  final bool isProtected;
 
-  static Future<ToolAction?> show(BuildContext context, {int initialTab = 0}) {
+  const ToolsSheet({super.key, this.initialTab = 0, this.isProtected = false});
+
+  static Future<ToolAction?> show(
+    BuildContext context, {
+    int initialTab = 0,
+    bool isProtected = false,
+  }) {
     return showModalBottomSheet<ToolAction>(
       context: context,
       isScrollControlled: true,
-      builder: (_) => ToolsSheet(initialTab: initialTab),
+      builder: (_) =>
+          ToolsSheet(initialTab: initialTab, isProtected: isProtected),
     );
   }
 
@@ -54,6 +75,12 @@ class ToolsSheet extends StatelessWidget {
     _Tool(ToolAction.compress, Icons.compress_rounded, 'Compress', Color(0xFFFFB224)),
     _Tool(ToolAction.split, Icons.call_split_rounded, 'Split PDF', Color(0xFF30A46C)),
     _Tool(ToolAction.merge, Icons.library_add_outlined, 'Merge PDF', Color(0xFFF76B15)),
+    _Tool(ToolAction.watermark, Icons.branding_watermark_outlined, 'Watermark', Color(0xFF3E8BFF)),
+    _Tool(ToolAction.pageNumbers, Icons.format_list_numbered_rounded, 'Page numbers', Color(0xFF7C6CF2)),
+    _Tool(ToolAction.extractText, Icons.text_snippet_outlined, 'Extract text', Color(0xFF30A46C)),
+    _Tool(ToolAction.ocr, Icons.document_scanner_outlined, 'Recognise text', Color(0xFFF76B15)),
+    _Tool(ToolAction.flatten, Icons.layers_clear_outlined, 'Flatten', Color(0xFFFFB224)),
+    _Tool(ToolAction.protect, Icons.lock_outline_rounded, 'Protect', Color(0xFFE5484D)),
   ];
 
   static const List<_Tool> _annotateTools = [
@@ -64,6 +91,10 @@ class ToolsSheet extends StatelessWidget {
     _Tool(ToolAction.underline, Icons.format_underlined_rounded, 'Underline', Color(0xFF30A46C)),
     _Tool(ToolAction.strikethrough, Icons.format_strikethrough_rounded, 'Strikethrough', Color(0xFFE5484D)),
     _Tool(ToolAction.draw, Icons.draw_rounded, 'Draw', Color(0xFF3E8BFF)),
+    _Tool(ToolAction.marker, Icons.brush_outlined, 'Marker', Color(0xFFFFB224)),
+    _Tool(ToolAction.shapes, Icons.category_outlined, 'Shapes', Color(0xFF30A46C)),
+    _Tool(ToolAction.note, Icons.sticky_note_2_outlined, 'Note', Color(0xFFF76B15)),
+    _Tool(ToolAction.eraser, Icons.auto_fix_normal_outlined, 'Eraser', Color(0xFFE5484D)),
     _Tool(ToolAction.signature, Icons.history_edu_rounded, 'Signature', Color(0xFF7C6CF2)),
   ];
 
@@ -106,7 +137,12 @@ class ToolsSheet extends StatelessWidget {
             ),
             const Divider(height: 1),
             SizedBox(
-              height: _rowHeight * 3 + 8 * 2 + 24,
+              // Four rows where the screen has room for them; the grids
+              // scroll for the rest.
+              height: math.min(
+                _rowHeight * 4 + 8 * 3 + 24,
+                MediaQuery.of(context).size.height * 0.62,
+              ),
               child: TabBarView(
                 children: [
                   _grid(context, _documentTools),
@@ -122,7 +158,9 @@ class ToolsSheet extends StatelessWidget {
 
   Widget _grid(BuildContext context, List<_Tool> tools) {
     final ThemeData theme = Theme.of(context);
-    // A fixed row height rather than an aspect ratio, so three rows fit the
+    bool unlock(_Tool tool) =>
+        isProtected && tool.action == ToolAction.protect;
+    // A fixed row height rather than an aspect ratio, so whole rows fit the
     // sheet on any width instead of the last one sliding out of view.
     return GridView(
       padding: const EdgeInsets.fromLTRB(8, 16, 8, 8),
@@ -146,11 +184,14 @@ class ToolsSheet extends StatelessWidget {
                     shape: BoxShape.circle,
                     color: tool.color.withValues(alpha: 0.16),
                   ),
-                  child: Icon(tool.icon, color: tool.color),
+                  child: Icon(
+                    unlock(tool) ? Icons.lock_open_rounded : tool.icon,
+                    color: tool.color,
+                  ),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  tool.label,
+                  unlock(tool) ? 'Remove password' : tool.label,
                   textAlign: TextAlign.center,
                   maxLines: 2,
                   style: theme.textTheme.bodyMedium,
